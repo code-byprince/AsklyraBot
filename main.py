@@ -12,6 +12,7 @@ from collections import defaultdict
 from io import StringIO, BytesIO
 
 import telebot
+import httpx
 from telebot import types
 from flask import Flask, request
 from openai import OpenAI
@@ -44,7 +45,7 @@ log = logging.getLogger(__name__)
 #  CLIENTS
 # ─────────────────────────────────────────────
 bot    = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
-client = OpenAI(base_url="https://router.huggingface.co/v1", api_key=HF_TOKEN)
+client = OpenAI(base_url="https://router.huggingface.co/v1", api_key=HF_TOKEN, http_client=httpx.Client())
 app    = Flask(__name__)
 
 # ─────────────────────────────────────────────
