@@ -2,6 +2,7 @@
 Flask==3.0.3
 pyTelegramBotAPI==4.21.0
 openai==1.51.0
+httpx==0.27.2
 requests==2.32.3
 
 # ── OPTIONAL — file analysis (missing hone par bhi bot crash nahi hoga,
