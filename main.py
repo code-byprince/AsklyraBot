@@ -680,6 +680,7 @@ def cmd_help(msg):
         "/summarize [text] — Summarize text\n"
         "/leaderboard — Top users\n"
         "/testai — Check which AI models are online\n"
+        "/checkkey — Debug: verify your GROQ_API_KEY is loaded correctly\n"
         "/help — This message\n\n"
         "💬 Just type normally for <b>unlimited questions</b> — no limits, "
         "and I auto-switch models if one is busy so you never see an error."
@@ -875,6 +876,29 @@ def cmd_testai(msg):
             results.append(f"❌ <code>{model}</code> → {type(e).__name__}: {str(e)[:60]}")
     text = "<b>🧪 Model Test Results (Groq):</b>\n\n" + "\n".join(results)
     bot.edit_message_text(text, msg.chat.id, wait.message_id, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["checkkey"])
+def cmd_checkkey(msg):
+    """Debug command — shows a masked version of the GROQ_API_KEY the bot is actually using."""
+    if not GROQ_API_KEY:
+        bot.send_message(msg.chat.id, "❌ <b>GROQ_API_KEY is EMPTY / not set</b> in Render environment.", parse_mode="HTML")
+        return
+    key = GROQ_API_KEY
+    length = len(key)
+    starts_ok = key.startswith("gsk_")
+    has_space = " " in key or "\n" in key or "\t" in key
+    masked = key[:8] + "..." + key[-4:] if length > 12 else "(too short!)"
+    text = (
+        "🔑 <b>GROQ_API_KEY Debug:</b>\n\n"
+        f"• Value seen by bot: <code>{masked}</code>\n"
+        f"• Length: <b>{length}</b> characters\n"
+        f"• Starts with 'gsk_': <b>{'✅ Yes' if starts_ok else '❌ NO — wrong key type!'}</b>\n"
+        f"• Contains space/newline: <b>{'❌ YES — this breaks it!' if has_space else '✅ No'}</b>\n\n"
+        "A real Groq key is usually 50-60+ characters and starts with <code>gsk_</code>. "
+        "If length looks short or starts wrong, the Render env var has a copy-paste problem."
+    )
+    bot.send_message(msg.chat.id, text, parse_mode="HTML")
 
 
 @bot.message_handler(commands=["broadcast"])
