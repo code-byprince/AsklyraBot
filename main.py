@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ADVANCED TELEGRAM AI BOT  — DeepSeek via HuggingFace Router
-#  Features: File analysis, Voice, Group admin, Analytics, Unlimited history
+#  ADVANCED TELEGRAM AI BOT  —  Powered by Groq (Llama/Qwen/GPT-OSS/DeepSeek/Kimi)
+#  Features: Multi-model AI, 100+ language translate, long-term memory,
+#            conversation summarization, file analysis, voice, group admin,
+#            live analytics, unlimited questions with zero-error fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import os, re, io, csv, json, time, random, logging, zipfile, threading
@@ -49,55 +51,41 @@ logger = logging.getLogger(__name__)
 
 # ── Environment ────────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.environ.get("BOT_TOKEN")
-HF_TOKEN   = os.environ.get("HF_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 ADMIN_IDS  = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set!")
-if not HF_TOKEN:
-    raise RuntimeError("HF_TOKEN not set!")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY not set! Get a free key (no credit card) at https://console.groq.com/keys")
 
 # ── Clients ────────────────────────────────────────────────────────────────────
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 ai_client = OpenAI(
-    base_url="https://router.huggingface.co/v1",
-    api_key=HF_TOKEN,
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY,
 )
 
+# Groq free tier — no credit card, generous daily limits, OpenAI-compatible.
+# These are Groq's current (non-deprecated) production model IDs as of June 2026.
 MODELS = [
-    # DeepSeek
-    "deepseek-ai/DeepSeek-V4-Pro:novita",
-    "deepseek-ai/DeepSeek-V4-Pro:together",
-    "deepseek-ai/DeepSeek-V3-0324:together",
-    "deepseek-ai/DeepSeek-V3-0324:fireworks-ai",
-    "deepseek-ai/DeepSeek-V3-0324:novita",
-    # Qwen
-    "Qwen/Qwen2.5-72B-Instruct:together",
-    "Qwen/Qwen2.5-72B-Instruct:novita",
-    "Qwen/QwQ-32B:together",
-    # Llama
-    "meta-llama/Llama-3.3-70B-Instruct:together",
-    "meta-llama/Llama-3.3-70B-Instruct:novita",
-    "meta-llama/Llama-3.1-8B-Instruct:novita",
-    # Mistral
-    "mistralai/Mistral-7B-Instruct-v0.3:together",
-    "mistralai/Mixtral-8x7B-Instruct-v0.1:together",
-    # GPT (open-weight GPT-OSS via HF router)
-    "openai/gpt-oss-120b:together",
-    "openai/gpt-oss-20b:together",
+    "openai/gpt-oss-120b",          # GPT — flagship reasoning, best quality
+    "openai/gpt-oss-20b",           # GPT — smaller/faster fallback
+    "qwen/qwen3.6-27b",             # Qwen — strong multilingual + reasoning
+    "deepseek-r1-distill-llama-70b",# DeepSeek — distilled reasoning model
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # Llama — fast general purpose
+    "moonshotai/kimi-k2",           # Kimi K2 — long-context backup
 ]
 MAX_TOKENS = 1024
 
 # Friendly labels for /model menu and display
 MODEL_LABELS = {
-    "deepseek": "DeepSeek",
-    "qwen":     "Qwen",
-    "qwq":      "Qwen (QwQ)",
-    "llama":    "Llama",
-    "mistral":  "Mistral",
-    "mixtral":  "Mixtral",
     "gpt-oss":  "GPT",
+    "qwen":     "Qwen",
+    "deepseek": "DeepSeek",
+    "llama":    "Llama",
+    "kimi":     "Kimi",
 }
 
 def model_family(model_id: str) -> str:
@@ -661,16 +649,18 @@ def cmd_start(msg):
         user_stats[uid]["name"] = msg.from_user.first_name or ""
     send_reaction(msg.chat.id, msg.message_id, "👋")
     text = (
-        f"👋 <b>Hello, {name}!</b>\n\n"
-        "I'm your <b>Advanced AI Assistant</b> powered by <b>DeepSeek</b>.\n\n"
-        "<b>What I can do:</b>\n"
-        "• Answer <b>unlimited questions</b> with full memory\n"
-        "• <b>Read & analyze</b> PDF, DOCX, Excel, CSV, JSON, ZIP, code files\n"
-        "• <b>Translate</b> text in any language\n"
-        "• <b>Summarize</b> long content\n"
-        "• <b>Code review</b> and debugging\n"
-        "• <b>Voice messages</b> (speech to text)\n\n"
-        "Choose a mode or just start typing! 👇"
+        f"⚡ <b>Welcome, {name}!</b>\n\n"
+        "🧠 <b>Multi-Model AI Engine</b> — GPT-OSS • Qwen • DeepSeek • Llama • Kimi\n"
+        "🚀 Running on <b>Groq LPU</b> — some of the fastest AI inference in the world\n\n"
+        "<b>✨ What I can do:</b>\n"
+        "• 💬 <b>Unlimited questions</b> — no limits, no usage caps\n"
+        "• 🧬 <b>Auto model-switching</b> — never see an error, ever\n"
+        "• 🌐 <b>Translate</b> — 100+ languages, instantly\n"
+        "• 📄 <b>Read files</b> — PDF, DOCX, Excel, CSV, JSON, ZIP, code\n"
+        "• 🎙 <b>Voice messages</b> — speech to text\n"
+        "• 🧠 <b>Long-term memory</b> — I remember you, even after restarts\n"
+        "• 📝 <b>Smart summarization</b> — long chats compress automatically\n\n"
+        f"<i>{len(MODELS)} AI models active right now. Pick a mode below or just start typing 👇</i>"
     )
     bot.send_message(msg.chat.id, text, parse_mode="HTML", reply_markup=main_menu_kb())
 
@@ -723,16 +713,16 @@ def cmd_model(msg):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("🤖 Auto (recommended)", callback_data="setmodel_auto"),
-        types.InlineKeyboardButton("🐳 DeepSeek",  callback_data="setmodel_deepseek"),
-        types.InlineKeyboardButton("🔮 Qwen",      callback_data="setmodel_qwen"),
-        types.InlineKeyboardButton("🦙 Llama",     callback_data="setmodel_llama"),
-        types.InlineKeyboardButton("🌬️ Mistral",   callback_data="setmodel_mistral"),
         types.InlineKeyboardButton("🧬 GPT",       callback_data="setmodel_gpt-oss"),
+        types.InlineKeyboardButton("🔮 Qwen",      callback_data="setmodel_qwen"),
+        types.InlineKeyboardButton("🐳 DeepSeek",  callback_data="setmodel_deepseek"),
+        types.InlineKeyboardButton("🦙 Llama",     callback_data="setmodel_llama"),
+        types.InlineKeyboardButton("🌙 Kimi",      callback_data="setmodel_kimi"),
     )
     bot.send_message(msg.chat.id,
-        f"🤖 <b>Choose preferred AI model:</b>\n\nCurrent: <b>{current}</b>\n\n"
-        "Even if you pick one, I'll auto-switch to another if it's ever busy — "
-        "so you never get stuck or see an error.",
+        f"⚡ <b>Choose preferred AI model:</b>\n\nCurrent: <b>{current}</b>\n\n"
+        "All models run on <b>Groq's LPU hardware</b> — even if you pick one, "
+        "I'll auto-switch to another if it's ever busy, so you never get stuck or see an error.",
         parse_mode="HTML", reply_markup=kb)
 
 
@@ -866,22 +856,24 @@ def cmd_admin(msg):
 
 @bot.message_handler(commands=["testai"])
 def cmd_testai(msg):
-    """Debug command — tests AI connection across all models and shows results."""
+    """Debug command — tests AI connection across all models and shows results + speed."""
     send_typing(msg.chat.id)
     wait = bot.send_message(msg.chat.id, "🔄 Testing AI connections...")
     results = []
     for model in MODELS:
         try:
+            t0 = time.time()
             resp = ai_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": "Say OK"}],
                 max_tokens=10,
             )
+            elapsed = time.time() - t0
             reply = (resp.choices[0].message.content or "").strip()
-            results.append(f"✅ <code>{model}</code> → {reply[:30]}")
+            results.append(f"✅ <code>{model}</code> → {reply[:30]} <i>({elapsed:.2f}s ⚡)</i>")
         except Exception as e:
             results.append(f"❌ <code>{model}</code> → {type(e).__name__}: {str(e)[:60]}")
-    text = "<b>🧪 Model Test Results:</b>\n\n" + "\n".join(results)
+    text = "<b>🧪 Model Test Results (Groq):</b>\n\n" + "\n".join(results)
     bot.edit_message_text(text, msg.chat.id, wait.message_id, parse_mode="HTML")
 
 
