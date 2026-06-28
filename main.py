@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ADVANCED TELEGRAM AI BOT  — DeepSeek via HuggingFace Router
 #  Features: File analysis, Voice, Group admin, Analytics, Unlimited history
@@ -495,327 +496,507 @@ def cmd_help(msg):
     )
     if is_admin(msg.from_user.id):
         text += (
-            "\n<b>🔐 Admin    (["wow", "amazing", "incredible", "unbelievable"],     "🤩"),
-    (["food", "khana", "eat", "recipe", "hungry"],         "🍕"),
-    (["music", "song", "gaana", "listen", "playlist"],     "🎵"),
-    (["sports", "cricket", "football", "game", "match"],   "⚽"),
-    (["weather", "rain", "sunny", "temperature", "mausam"],"⛅"),
-]
-
-DEFAULT_REACTIONS = ["👍", "🔥", "💯", "⚡", "🤩", "👏"]
-
-def pick_reaction(text: str) -> str:
-    lowered = text.lower()
-    for keywords, emoji in REACTION_MAP:
-        if any(kw in lowered for kw in keywords):
-            return emoji
-    return random.choice(DEFAULT_REACTIONS)
-
-def send_reaction(chat_id: int, message_id: int, emoji: str):
-    """Send reaction using raw Telegram API — more reliable than pyTelegramBotAPI wrapper."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMessageReaction"
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "reaction": [{"type": "emoji", "emoji": emoji}],
-        "is_big": False,
-    }
-    try:
-        resp = http_requests.post(url, json=payload, timeout=5)
-        data = resp.json()
-        if not data.get("ok"):
-            logger.warning(f"Reaction failed: {data.get('description')}")
-    except Exception as e:
-        logger.warning(f"Reaction error: {e}")
-
-# ── Text Formatting ───────────────────────────────────────────────────────────
-def clean_ai_response(text: str) -> str:
-    """
-    Remove markdown headers (#, ##, ###) and convert **bold** to *bold*
-    so Telegram HTML mode can render it. Returns HTML-safe string.
-    """
-    # Remove heading markers (# ## ###) — replace with plain text + newline
-    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
-
-    # Convert **bold** → <b>bold</b>
-    text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-
-    # Convert *italic* (single) → <i>italic</i>  — only if not already a bold tag
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
-
-    # Convert `inline code` → <code>inline code</code>
-    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
-
-    # Convert triple backtick code blocks → <pre>
-    text = re.sub(r"```(?:\w+)?\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
-
-    # Escape remaining & < > that are NOT part of our HTML tags
-    # (We inserted our own tags so we protect them)
-    # This is tricky — we use a safe approach: escape first, then re-insert tags
-    return text
-
-def format_for_telegram(raw: str) -> str:
-    """Full pipeline: clean AI markdown → Telegram HTML."""
-    return clean_ai_response(raw)
-
-# ── Utility ───────────────────────────────────────────────────────────────────
-def send_typing(chat_id: int):
-    try:
-        bot.send_chat_action(chat_id, "typing")
-    except Exception:
-        pass
-
-def update_stats(user_id: int):
-    if user_id not in user_stats:
-        user_stats[user_id] = {"count": 0, "first_seen": datetime.now().strftime("%Y-%m-%d")}
-    user_stats[user_id]["count"] += 1
-
-# ── AI Core ───────────────────────────────────────────────────────────────────
-def get_ai_response(user_id: int, user_message: str) -> str:
-    if user_id not in user_histories:
-        user_histories[user_id] = []
-
-    mode    = user_modes.get(user_id, "normal")
-    history = user_histories[user_id]
-    history.append({"role": "user", "content": user_message})
-
-    if len(history) > MAX_HISTORY:
-        history = history[-MAX_HISTORY:]
-        user_histories[user_id] = history
-
-    system = BASE_SYSTEM
-    if mode in MODE_PROMPTS and MODE_PROMPTS[mode]:
-        system += "\n\nCURRENT MODE: " + MODE_PROMPTS[mode]
-
-    messages = [{"role": "system", "content": system}] + history
-
-    try:
-        response = ai_client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=1500,
-            temperature=0.7,
+            "\n<b>🔐 Admin Commands:</b>\n"
+            "/admin — Admin dashboard\n"
+            "/broadcast [msg] — Send to all users\n"
         )
-        reply = response.choices[0].message.content.strip()
-        history.append({"role": "assistant", "content": reply})
-        return reply
-    except Exception as e:
-        logger.error(f"AI API error: {e}")
-        return "Sorry, something went wrong. Please try again in a moment."
-
-# ── Inline Keyboard Helpers ───────────────────────────────────────────────────
-def main_menu_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🧠 Normal Mode",     callback_data="mode_normal"),
-        types.InlineKeyboardButton("🌐 Translate Mode",  callback_data="mode_translate"),
-        types.InlineKeyboardButton("📝 Summarize Mode",  callback_data="mode_summarize"),
-        types.InlineKeyboardButton("💻 Code Mode",       callback_data="mode_code"),
-        types.InlineKeyboardButton("📊 My Stats",        callback_data="stats"),
-        types.InlineKeyboardButton("🗑️ Clear History",   callback_data="clear"),
-    )
-    return kb
-
-# ── Command Handlers ──────────────────────────────────────────────────────────
-@bot.message_handler(commands=["start"])
-def handle_start(message):
-    user_id = message.from_user.id
-    name    = message.from_user.first_name or "there"
-    update_stats(user_id)
-    send_reaction(message.chat.id, message.message_id, "👋")
-
-    text = (
-        f"👋 <b>Hello, {name}!</b>\n\n"
-        "I'm your <b>AI Assistant</b> powered by DeepSeek.\n\n"
-        "I can help you with:\n"
-        "• Answering <b>any question</b>\n"
-        "• <b>Translating</b> text to any language\n"
-        "• <b>Summarizing</b> long content\n"
-        "• <b>Coding</b> help and debugging\n"
-        "• <b>Writing</b> and editing\n\n"
-        "Choose a mode below or just start typing!"
-    )
-    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=main_menu_keyboard())
-
-
-@bot.message_handler(commands=["help"])
-def handle_help(message):
-    send_reaction(message.chat.id, message.message_id, "💡")
-    text = (
-        "<b>Available Commands:</b>\n\n"
-        "/start — Welcome screen + mode selector\n"
-        "/mode — Switch AI mode\n"
-        "/clear — Clear conversation history\n"
-        "/stats — Your usage stats\n"
-        "/ask [question] — Quick question\n"
-        "/translate [text] — Translate text\n"
-        "/summarize [text] — Summarize text\n"
-        "/help — Show this message\n\n"
-        "<b>Modes:</b>\n"
-        "• Normal — General AI assistant\n"
-        "• Translate — Auto-translate messages\n"
-        "• Summarize — Summarize any text\n"
-        "• Code — Coding assistant"
-    )
-    bot.send_message(message.chat.id, text, parse_mode="HTML")
+    bot.send_message(msg.chat.id, text, parse_mode="HTML")
 
 
 @bot.message_handler(commands=["mode"])
-def handle_mode(message):
+def cmd_mode(msg):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("🧠 Normal",    callback_data="mode_normal"),
         types.InlineKeyboardButton("🌐 Translate", callback_data="mode_translate"),
         types.InlineKeyboardButton("📝 Summarize", callback_data="mode_summarize"),
         types.InlineKeyboardButton("💻 Code",      callback_data="mode_code"),
+        types.InlineKeyboardButton("✍️ Essay",     callback_data="mode_essay"),
     )
-    bot.send_message(message.chat.id, "Select a mode:", reply_markup=kb)
+    bot.send_message(msg.chat.id, "🔄 <b>Select AI Mode:</b>", parse_mode="HTML", reply_markup=kb)
 
 
 @bot.message_handler(commands=["clear"])
-def handle_clear(message):
-    user_histories[message.from_user.id] = []
-    send_reaction(message.chat.id, message.message_id, "👍")
-    bot.send_message(message.chat.id, "🗑️ <b>Conversation cleared!</b> Starting fresh.", parse_mode="HTML")
+def cmd_clear(msg):
+    user_histories[msg.from_user.id] = []
+    send_reaction(msg.chat.id, msg.message_id, "👍")
+    bot.send_message(msg.chat.id, "🗑️ <b>History cleared!</b> Fresh start.", parse_mode="HTML")
 
 
 @bot.message_handler(commands=["stats"])
-def handle_stats(message):
-    user_id = message.from_user.id
-    update_stats(user_id)
-    s     = user_stats.get(user_id, {})
+def cmd_stats(msg):
+    uid   = msg.from_user.id
+    track_message(uid)
+    s     = user_stats.get(uid, {})
     count = s.get("count", 0)
     since = s.get("first_seen", "today")
-    mode  = user_modes.get(user_id, "normal").capitalize()
-    hist  = len(user_histories.get(user_id, []))
-
+    mode  = user_modes.get(uid, "normal").capitalize()
+    hist  = len(user_histories.get(uid, []))
+    toks  = s.get("tokens_used", 0)
     text = (
         "📊 <b>Your Stats:</b>\n\n"
         f"• Messages sent: <b>{count}</b>\n"
-        f"• Using bot since: <b>{since}</b>\n"
+        f"• Tokens used: <b>{toks:,}</b>\n"
+        f"• Using since: <b>{since}</b>\n"
         f"• Current mode: <b>{mode}</b>\n"
-        f"• History length: <b>{hist} messages</b>"
+        f"• History: <b>{hist} messages</b>"
     )
-    bot.send_message(message.chat.id, text, parse_mode="HTML")
+    bot.send_message(msg.chat.id, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["leaderboard"])
+def cmd_leaderboard(msg):
+    lb   = leaderboard()
+    rows = ["🏆 <b>Top Users:</b>\n"]
+    medals = ["🥇","🥈","🥉"] + ["🔹"]*7
+    for i, (uid, count, name, toks) in enumerate(lb):
+        display = name or f"User{uid}"
+        rows.append(f"{medals[i]} {display} — <b>{count}</b> msgs ({toks:,} tokens)")
+    bot.send_message(msg.chat.id, "\n".join(rows), parse_mode="HTML")
 
 
 @bot.message_handler(commands=["ask"])
-def handle_ask(message):
-    question = message.text.partition(" ")[2].strip()
-    if not question:
-        bot.send_message(message.chat.id, "Usage: /ask What is quantum computing?")
+def cmd_ask(msg):
+    q = msg.text.partition(" ")[2].strip()
+    if not q:
+        bot.send_message(msg.chat.id, "Usage: /ask Your question here")
         return
-    send_typing(message.chat.id)
-    send_reaction(message.chat.id, message.message_id, "🤔")
-    reply = get_ai_response(message.from_user.id, question)
-    formatted = format_for_telegram(reply)
-    bot.send_message(message.chat.id, formatted, parse_mode="HTML")
+    track_message(msg.from_user.id)
+    send_typing(msg.chat.id)
+    send_reaction(msg.chat.id, msg.message_id, "🤔")
+    reply = get_ai_response(msg.from_user.id, q)
+    safe_send(msg.chat.id, format_for_telegram(reply), reply_to=msg.message_id)
 
 
 @bot.message_handler(commands=["translate"])
-def handle_translate(message):
-    text_to_translate = message.text.partition(" ")[2].strip()
-    if not text_to_translate:
-        bot.send_message(message.chat.id, "Usage: /translate Aap kaise hain?")
+def cmd_translate(msg):
+    txt = msg.text.partition(" ")[2].strip()
+    if not txt:
+        bot.send_message(msg.chat.id, "Usage: /translate Aap kaise hain?")
         return
-    send_typing(message.chat.id)
-    send_reaction(message.chat.id, message.message_id, "🌐")
-    prompt = f"Translate this to English and tell me what language it was: {text_to_translate}"
-    reply  = get_ai_response(message.from_user.id, prompt)
-    bot.send_message(message.chat.id, format_for_telegram(reply), parse_mode="HTML")
+    track_message(msg.from_user.id)
+    send_typing(msg.chat.id)
+    send_reaction(msg.chat.id, msg.message_id, "🌐")
+    reply = get_ai_response(msg.from_user.id,
+        f"Detect the language and translate this to English:\n\n{txt}")
+    safe_send(msg.chat.id, format_for_telegram(reply), reply_to=msg.message_id)
 
 
 @bot.message_handler(commands=["summarize"])
-def handle_summarize(message):
-    content = message.text.partition(" ")[2].strip()
-    if not content:
-        bot.send_message(message.chat.id, "Usage: /summarize [paste your long text here]")
+def cmd_summarize(msg):
+    txt = msg.text.partition(" ")[2].strip()
+    if not txt:
+        bot.send_message(msg.chat.id, "Usage: /summarize [long text here]")
         return
-    send_typing(message.chat.id)
-    send_reaction(message.chat.id, message.message_id, "📝")
-    prompt = f"Summarize this in 3-5 bullet points:\n\n{content}"
-    reply  = get_ai_response(message.from_user.id, prompt)
-    bot.send_message(message.chat.id, format_for_telegram(reply), parse_mode="HTML")
+    track_message(msg.from_user.id)
+    send_typing(msg.chat.id)
+    send_reaction(msg.chat.id, msg.message_id, "📝")
+    reply = get_ai_response(msg.from_user.id,
+        f"Summarize in 3-5 bullet points:\n\n{txt}")
+    safe_send(msg.chat.id, format_for_telegram(reply), reply_to=msg.message_id)
 
 
-# ── Callback Query Handler ────────────────────────────────────────────────────
-@bot.callback_query_handler(func=lambda call: True)
+# ── ADMIN COMMANDS ─────────────────────────────────────────────────────────────
+@bot.message_handler(commands=["admin"])
+def cmd_admin(msg):
+    if not is_admin(msg.from_user.id):
+        bot.send_message(msg.chat.id, "⛔ Admin only.")
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    text = (
+        "🔐 <b>Admin Dashboard</b>\n\n"
+        f"• Total users: <b>{len(analytics['total_users'])}</b>\n"
+        f"• Active today: <b>{len(analytics['active_today'])}</b>\n"
+        f"• Total messages: <b>{analytics['total_messages']:,}</b>\n"
+        f"• Today's messages: <b>{analytics['daily_messages'].get(today, 0)}</b>\n"
+        f"• Total tokens: <b>{analytics['total_tokens']:,}</b>\n"
+        f"• Errors logged: <b>{len(analytics['errors'])}</b>\n"
+    )
+    bot.send_message(msg.chat.id, text, parse_mode="HTML", reply_markup=admin_kb())
+
+
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(msg):
+    if not is_admin(msg.from_user.id):
+        bot.send_message(msg.chat.id, "⛔ Admin only.")
+        return
+    text = msg.text.partition(" ")[2].strip()
+    if not text:
+        bot.send_message(msg.chat.id, "Usage: /broadcast Your message here")
+        return
+    sent = 0
+    for uid in list(analytics["total_users"]):
+        try:
+            bot.send_message(uid, f"📢 <b>Announcement:</b>\n\n{text}", parse_mode="HTML")
+            sent += 1
+            time.sleep(0.05)
+        except Exception:
+            pass
+    bot.send_message(msg.chat.id, f"✅ Broadcast sent to <b>{sent}</b> users.", parse_mode="HTML")
+
+
+# ── GROUP ADMIN TOOLS ──────────────────────────────────────────────────────────
+@bot.message_handler(commands=["ban"])
+def cmd_ban(msg):
+    if msg.chat.type == "private":
+        bot.send_message(msg.chat.id, "This command works in groups only.")
+        return
+    try:
+        target = msg.reply_to_message.from_user.id if msg.reply_to_message else None
+        if not target:
+            bot.send_message(msg.chat.id, "Reply to a user's message to ban them.")
+            return
+        bot.ban_chat_member(msg.chat.id, target)
+        bot.send_message(msg.chat.id, "✅ User banned.")
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ Could not ban: {e}")
+
+
+@bot.message_handler(commands=["unban"])
+def cmd_unban(msg):
+    if msg.chat.type == "private":
+        return
+    try:
+        target = msg.reply_to_message.from_user.id if msg.reply_to_message else None
+        if not target:
+            bot.send_message(msg.chat.id, "Reply to the user's message to unban.")
+            return
+        bot.unban_chat_member(msg.chat.id, target)
+        bot.send_message(msg.chat.id, "✅ User unbanned.")
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ Could not unban: {e}")
+
+
+@bot.message_handler(commands=["mute"])
+def cmd_mute(msg):
+    if msg.chat.type == "private":
+        return
+    try:
+        target = msg.reply_to_message.from_user.id if msg.reply_to_message else None
+        if not target:
+            bot.send_message(msg.chat.id, "Reply to a user's message to mute them.")
+            return
+        until = int(time.time()) + 3600  # mute 1 hour
+        bot.restrict_chat_member(msg.chat.id, target,
+            types.ChatPermissions(can_send_messages=False), until_date=until)
+        bot.send_message(msg.chat.id, "🔇 User muted for 1 hour.")
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ Could not mute: {e}")
+
+
+@bot.message_handler(commands=["unmute"])
+def cmd_unmute(msg):
+    if msg.chat.type == "private":
+        return
+    try:
+        target = msg.reply_to_message.from_user.id if msg.reply_to_message else None
+        if not target:
+            return
+        bot.restrict_chat_member(msg.chat.id, target,
+            types.ChatPermissions(
+                can_send_messages=True, can_send_media_messages=True,
+                can_send_polls=True, can_send_other_messages=True,
+            ))
+        bot.send_message(msg.chat.id, "🔊 User unmuted.")
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ Could not unmute: {e}")
+
+
+@bot.message_handler(commands=["kick"])
+def cmd_kick(msg):
+    if msg.chat.type == "private":
+        return
+    try:
+        target = msg.reply_to_message.from_user.id if msg.reply_to_message else None
+        if not target:
+            return
+        bot.ban_chat_member(msg.chat.id, target)
+        bot.unban_chat_member(msg.chat.id, target)
+        bot.send_message(msg.chat.id, "👢 User kicked.")
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ Could not kick: {e}")
+
+
+@bot.message_handler(commands=["pin"])
+def cmd_pin(msg):
+    if msg.chat.type == "private" or not msg.reply_to_message:
+        return
+    try:
+        bot.pin_chat_message(msg.chat.id, msg.reply_to_message.message_id)
+        bot.send_message(msg.chat.id, "📌 Message pinned.")
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CALLBACK HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+@bot.callback_query_handler(func=lambda c: True)
 def handle_callback(call):
-    user_id = call.from_user.id
-    data    = call.data
+    uid  = call.from_user.id
+    data = call.data
 
+    # ── Mode switching ──────────────────────────────────────────────────────
     if data.startswith("mode_"):
-        mode = data.replace("mode_", "")
-        user_modes[user_id] = mode
-        mode_names = {
+        mode = data[5:]
+        user_modes[uid] = mode
+        labels = {
             "normal":    "🧠 Normal Mode",
             "translate": "🌐 Translate Mode",
             "summarize": "📝 Summarize Mode",
             "code":      "💻 Code Mode",
+            "essay":     "✍️ Essay Mode",
         }
-        label = mode_names.get(mode, mode.capitalize())
-        bot.answer_callback_query(call.id, f"Switched to {label}")
-        bot.send_message(
-            call.message.chat.id,
-            f"Switched to <b>{label}</b>!\n\nNow just send your message.",
-            parse_mode="HTML",
-        )
+        label = labels.get(mode, mode.capitalize())
+        bot.answer_callback_query(call.id, f"✅ {label} activated!")
+        safe_send(call.message.chat.id,
+            f"✅ Switched to <b>{label}</b>!\n\nNow just send your message.")
 
+    # ── Clear history ────────────────────────────────────────────────────────
     elif data == "clear":
-        user_histories[user_id] = []
+        user_histories[uid] = []
         bot.answer_callback_query(call.id, "History cleared!")
-        bot.send_message(call.message.chat.id, "🗑️ <b>History cleared!</b>", parse_mode="HTML")
+        safe_send(call.message.chat.id, "🗑️ <b>History cleared!</b> Fresh start.")
 
-    elif data == "stats":
-        update_stats(user_id)
-        s     = user_stats.get(user_id, {})
+    # ── Personal stats ───────────────────────────────────────────────────────
+    elif data == "my_stats":
+        track_message(uid)
+        s     = user_stats.get(uid, {})
         count = s.get("count", 0)
         since = s.get("first_seen", "today")
-        mode  = user_modes.get(user_id, "normal").capitalize()
+        toks  = s.get("tokens_used", 0)
+        mode  = user_modes.get(uid, "normal").capitalize()
+        hist  = len(user_histories.get(uid, []))
         bot.answer_callback_query(call.id)
-        bot.send_message(
-            call.message.chat.id,
-            f"📊 <b>Stats:</b>\nMessages: <b>{count}</b>\nSince: <b>{since}</b>\nMode: <b>{mode}</b>",
-            parse_mode="HTML",
+        safe_send(call.message.chat.id,
+            f"📊 <b>Your Stats:</b>\n\n"
+            f"• Messages: <b>{count}</b>\n"
+            f"• Tokens: <b>{toks:,}</b>\n"
+            f"• Since: <b>{since}</b>\n"
+            f"• Mode: <b>{mode}</b>\n"
+            f"• History: <b>{hist} msgs</b>")
+
+    # ── Leaderboard ──────────────────────────────────────────────────────────
+    elif data == "leaderboard":
+        lb    = leaderboard()
+        medals = ["🥇","🥈","🥉"] + ["🔹"]*7
+        rows  = ["🏆 <b>Top Users:</b>\n"]
+        for i, (u, count, name, toks) in enumerate(lb):
+            display = name or f"User{u}"
+            rows.append(f"{medals[i]} {display} — <b>{count}</b> msgs")
+        bot.answer_callback_query(call.id)
+        safe_send(call.message.chat.id, "\n".join(rows))
+
+    # ── Admin: full analytics ────────────────────────────────────────────────
+    elif data == "admin_analytics" and is_admin(uid):
+        today  = datetime.now().strftime("%Y-%m-%d")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        avg_rt = (sum(analytics["response_times"]) / len(analytics["response_times"])
+                  if analytics["response_times"] else 0)
+        text = (
+            "📊 <b>Full Analytics:</b>\n\n"
+            f"• Total users: <b>{len(analytics['total_users'])}</b>\n"
+            f"• Active today: <b>{len(analytics['active_today'])}</b>\n"
+            f"• Today msgs: <b>{analytics['daily_messages'].get(today,0)}</b>\n"
+            f"• Yesterday msgs: <b>{analytics['daily_messages'].get(yesterday,0)}</b>\n"
+            f"• Total messages: <b>{analytics['total_messages']:,}</b>\n"
+            f"• Total tokens: <b>{analytics['total_tokens']:,}</b>\n"
+            f"• Avg response: <b>{avg_rt:.2f}s</b>\n"
+            f"• Error count: <b>{len(analytics['errors'])}</b>\n"
+            f"• Model: <b>{MODEL}</b>"
         )
+        bot.answer_callback_query(call.id)
+        safe_send(call.message.chat.id, text)
 
+    elif data == "admin_errors" and is_admin(uid):
+        errors = analytics["errors"][-10:]
+        if not errors:
+            text = "✅ No errors logged!"
+        else:
+            rows = ["❌ <b>Last 10 Errors:</b>\n"]
+            for e in reversed(errors):
+                rows.append(f"• [{e['time']}] User {e['user_id']}: {e['error'][:80]}")
+            text = "\n".join(rows)
+        bot.answer_callback_query(call.id)
+        safe_send(call.message.chat.id, text)
 
-# ── Main Message Handler ──────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text and not m.text.startswith("/"))
-def handle_message(message):
-    user_id   = message.from_user.id
-    chat_id   = message.chat.id
-    user_text = message.text.strip()
+    elif data == "admin_response" and is_admin(uid):
+        rt = analytics["response_times"]
+        if not rt:
+            text = "No response time data yet."
+        else:
+            avg = sum(rt)/len(rt)
+            mn  = min(rt)
+            mx  = max(rt)
+            text = (
+                "⚡ <b>Response Times:</b>\n\n"
+                f"• Average: <b>{avg:.2f}s</b>\n"
+                f"• Fastest: <b>{mn:.2f}s</b>\n"
+                f"• Slowest: <b>{mx:.2f}s</b>\n"
+                f"• Samples: <b>{len(rt)}</b>"
+            )
+        bot.answer_callback_query(call.id)
+        safe_send(call.message.chat.id, text)
 
-    logger.info(f"User {user_id} [{user_modes.get(user_id,'normal')}]: {user_text[:80]}")
-    update_stats(user_id)
+    elif data == "admin_files" and is_admin(uid):
+        ft = analytics["file_types"]
+        if not ft:
+            text = "No files processed yet."
+        else:
+            rows = ["📁 <b>File Type Usage:</b>\n"]
+            for ext, count in sorted(ft.items(), key=lambda x: -x[1]):
+                rows.append(f"• <code>{ext or 'unknown'}</code>: <b>{count}</b>")
+            text = "\n".join(rows)
+        bot.answer_callback_query(call.id)
+        safe_send(call.message.chat.id, text)
+
+    else:
+        bot.answer_callback_query(call.id)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DOCUMENT / FILE HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+@bot.message_handler(content_types=["document"])
+def handle_document(msg):
+    uid      = msg.from_user.id
+    chat_id  = msg.chat.id
+    doc      = msg.document
+    filename = doc.file_name or "file"
+    caption  = msg.caption or ""
+
+    track_message(uid)
+    send_reaction(chat_id, msg.message_id, "📄")
     send_typing(chat_id)
 
-    # Send reaction (raw API call — reliable)
-    emoji = pick_reaction(user_text)
-    send_reaction(chat_id, message.message_id, emoji)
-
-    # Get AI reply
-    raw_reply = get_ai_response(user_id, user_text)
-    formatted = format_for_telegram(raw_reply)
+    wait_msg = bot.send_message(chat_id, f"📂 Reading <b>{filename}</b>...", parse_mode="HTML")
 
     try:
-        bot.reply_to(message, formatted, parse_mode="HTML")
+        file_info = bot.get_file(doc.file_id)
+        file_bytes = bot.download_file(file_info.file_path)
     except Exception as e:
-        logger.warning(f"HTML parse failed ({e}), sending plain text")
-        bot.reply_to(message, raw_reply)
+        bot.edit_message_text(f"❌ Could not download file: {e}",
+                              chat_id, wait_msg.message_id)
+        return
+
+    parsed, label = parse_file(file_bytes, filename)
+
+    if not parsed:
+        bot.edit_message_text(
+            f"❌ Could not read <b>{filename}</b>. Unsupported format.",
+            chat_id, wait_msg.message_id, parse_mode="HTML")
+        return
+
+    # Build AI prompt
+    user_question = caption if caption else f"Analyze this {label} and give a detailed summary with key insights."
+    prompt = f"[{label}: {filename}]\n\n{parsed[:10000]}\n\nUser request: {user_question}"
+
+    bot.edit_message_text(f"🧠 Analyzing <b>{filename}</b>...", chat_id, wait_msg.message_id, parse_mode="HTML")
+
+    reply = get_ai_response(uid, prompt,
+        extra_system=f"The user has uploaded a {label}. Analyze it thoroughly. Format output clearly with sections and bold key points.")
+    bot.delete_message(chat_id, wait_msg.message_id)
+    safe_send(chat_id, format_for_telegram(reply), reply_to=msg.message_id)
 
 
-@bot.message_handler(content_types=["photo", "document", "sticker", "voice", "video"])
-def handle_unsupported(message):
-    bot.reply_to(
-        message,
-        "📝 I currently support <b>text messages</b> only. Please type your question!",
-        parse_mode="HTML",
-    )
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHOTO HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+@bot.message_handler(content_types=["photo"])
+def handle_photo(msg):
+    uid     = msg.from_user.id
+    chat_id = msg.chat.id
+    caption = msg.caption or "Describe this image in detail."
+
+    track_message(uid)
+    send_reaction(chat_id, msg.message_id, "🖼")
+    safe_send(chat_id,
+        "🖼 <b>Image received!</b>\n\nI can't directly see images yet, but if you have text in the image, use /ask to type it and I'll help!",
+        reply_to=msg.message_id)
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VOICE HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+@bot.message_handler(content_types=["voice"])
+def handle_voice(msg):
+    uid     = msg.from_user.id
+    chat_id = msg.chat.id
+    track_message(uid)
+    send_reaction(chat_id, msg.message_id, "🎵")
+
+    if not HAS_VOICE:
+        safe_send(chat_id,
+            "🎤 <b>Voice received!</b>\n\nVoice-to-text requires extra libraries.\n"
+            "Please <b>type your message</b> for now — I'll respond instantly!",
+            reply_to=msg.message_id)
+        return
+
+    send_typing(chat_id)
+    wait_msg = bot.send_message(chat_id, "🎤 Transcribing voice message...")
+    try:
+        file_info  = bot.get_file(msg.voice.file_id)
+        ogg_bytes  = bot.download_file(file_info.file_path)
+        audio      = AudioSegment.from_ogg(io.BytesIO(ogg_bytes))
+        wav_buf    = io.BytesIO()
+        audio.export(wav_buf, format="wav")
+        wav_buf.seek(0)
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_buf) as source:
+            audio_data = recognizer.record(source)
+        transcribed = recognizer.recognize_google(audio_data)
+
+        bot.edit_message_text(f"🎤 <b>You said:</b> {transcribed}", chat_id, wait_msg.message_id, parse_mode="HTML")
+
+        reply = get_ai_response(uid, transcribed)
+        safe_send(chat_id, format_for_telegram(reply), reply_to=msg.message_id)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Could not transcribe: {e}", chat_id, wait_msg.message_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN TEXT HANDLER  — unlimited questions, smart retry
+# ═══════════════════════════════════════════════════════════════════════════════
+@bot.message_handler(func=lambda m: m.text and not m.text.startswith("/"))
+def handle_text(msg):
+    uid       = msg.from_user.id
+    chat_id   = msg.chat.id
+    user_text = msg.text.strip()
+
+    # Store name
+    if uid not in user_stats:
+        user_stats[uid] = {"count": 0, "first_seen": datetime.now().strftime("%Y-%m-%d"),
+                           "name": "", "tokens_used": 0}
+    user_stats[uid]["name"] = msg.from_user.first_name or ""
+
+    track_message(uid)
+    logger.info(f"User {uid} [{user_modes.get(uid,'normal')}]: {user_text[:60]}")
+
+    send_typing(chat_id)
+    send_reaction(chat_id, msg.message_id, pick_reaction(user_text))
+
+    # Retry logic — up to 3 attempts on failure
+    for attempt in range(3):
+        raw_reply = get_ai_response(uid, user_text)
+        if not raw_reply.startswith("⚠️"):
+            break
+        if attempt < 2:
+            time.sleep(1.5)
+
+    formatted = format_for_telegram(raw_reply)
+    safe_send(chat_id, formatted, reply_to=msg.message_id)
+
+
+@bot.message_handler(content_types=["sticker", "video", "video_note", "audio"])
+def handle_other(msg):
+    safe_send(msg.chat.id,
+        "📝 Send me <b>text</b>, <b>documents</b> (PDF/DOCX/Excel/CSV/JSON/ZIP), or <b>voice messages</b>!",
+        reply_to=msg.message_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     PORT       = int(os.environ.get("PORT", 5000))
     RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
@@ -824,10 +1005,10 @@ if __name__ == "__main__":
         webhook_url = f"{RENDER_URL}/{BOT_TOKEN}"
         bot.remove_webhook()
         bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set → {webhook_url}")
+        logger.info(f"✅ Webhook → {webhook_url}")
         app.run(host="0.0.0.0", port=PORT)
     else:
-        logger.info("Starting in polling mode (local dev)...")
+        logger.info("🔄 Polling mode (local)...")
         bot.remove_webhook()
         threading.Thread(target=bot.infinity_polling, daemon=True).start()
         app.run(host="0.0.0.0", port=PORT)
