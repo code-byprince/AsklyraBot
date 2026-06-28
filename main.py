@@ -65,7 +65,8 @@ ai_client = OpenAI(
     api_key=HF_TOKEN,
 )
 
-MODEL      = "deepseek-ai/DeepSeek-V3-0324:novita"
+MODEL          = "deepseek-ai/DeepSeek-V4-Pro:novita"
+MODEL_FALLBACK = "deepseek-ai/DeepSeek-V3-0324:fireworks-ai"
 MAX_TOKENS = 2048
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -268,24 +269,41 @@ def get_ai_response(user_id: int, user_message: str, extra_system: str = "") -> 
     messages = [{"role": "system", "content": system}] + history
 
     t0 = time.time()
-    try:
-        resp = ai_client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-            temperature=0.7,
-        )
-        reply  = resp.choices[0].message.content.strip()
-        tokens = getattr(resp.usage, "total_tokens", 0)
-        history.append({"role": "assistant", "content": reply})
-        track_tokens(tokens, user_id)
-        analytics["model_usage"][MODEL] += 1
-        track_response_time(time.time() - t0)
-        return reply
-    except Exception as e:
-        track_error(user_id, e)
-        logger.error(f"AI error for {user_id}: {e}")
-        return "⚠️ AI service is temporarily unavailable. Please try again in a moment."
+    
+    # Try primary model, then fallback
+    for attempt_model in [MODEL, MODEL_FALLBACK]:
+        try:
+            resp = ai_client.chat.completions.create(
+                model=attempt_model,
+                messages=messages,
+                max_tokens=MAX_TOKENS,
+                temperature=0.7,
+            )
+            reply  = resp.choices[0].message.content.strip()
+            tokens = getattr(resp.usage, "total_tokens", 0)
+            history.append({"role": "assistant", "content": reply})
+            track_tokens(tokens, user_id)
+            analytics["model_usage"][attempt_model] += 1
+            track_response_time(time.time() - t0)
+            return reply
+        except Exception as e:
+            err_str = str(e)
+            logger.error(f"AI error [{attempt_model}] user {user_id}: {type(e).__name__}: {err_str}")
+            if attempt_model == MODEL_FALLBACK:
+                # Both models failed — return specific error
+                track_error(user_id, err_str)
+                if "401" in err_str or "authentication" in err_str.lower() or "api key" in err_str.lower():
+                    return "❌ HF_TOKEN invalid or expired. Check your HuggingFace API token in Render environment variables."
+                elif "404" in err_str or "model" in err_str.lower():
+                    return "❌ AI model unavailable. Please try again later."
+                elif "429" in err_str or "rate" in err_str.lower():
+                    return "⏳ Too many requests. Please wait 15 seconds and try again."
+                elif "timeout" in err_str.lower() or "connection" in err_str.lower():
+                    return "⏳ Connection timeout. Please try again."
+                else:
+                    return f"❌ Error: {err_str[:200]}"
+            # Primary failed, trying fallback
+            logger.warning(f"Primary model failed, trying fallback...")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FILE PARSERS
@@ -613,6 +631,27 @@ def cmd_admin(msg):
         f"• Errors logged: <b>{len(analytics['errors'])}</b>\n"
     )
     bot.send_message(msg.chat.id, text, parse_mode="HTML", reply_markup=admin_kb())
+
+
+@bot.message_handler(commands=["testai"])
+def cmd_testai(msg):
+    """Debug command — tests AI connection and shows exact error if any."""
+    send_typing(msg.chat.id)
+    bot.send_message(msg.chat.id, "🔄 Testing AI connection...")
+    try:
+        resp = ai_client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": "Say OK"}],
+            max_tokens=10,
+        )
+        reply = resp.choices[0].message.content.strip()
+        bot.send_message(msg.chat.id,
+            f"✅ <b>AI Connection OK!</b>\nModel: <code>{MODEL}</code>\nResponse: {reply}",
+            parse_mode="HTML")
+    except Exception as e:
+        bot.send_message(msg.chat.id,
+            f"❌ <b>AI Connection FAILED</b>\n\nError type: <code>{type(e).__name__}</code>\n\nFull error:\n<code>{str(e)[:500]}</code>",
+            parse_mode="HTML")
 
 
 @bot.message_handler(commands=["broadcast"])
