@@ -1,1451 +1,608 @@
-# -*- coding: utf-8 -*-
-# ================================================================
-#  ADVANCED TELEGRAM AI BOT  —  Bynara API
-#  All features included — Render.com ready
-# ================================================================
-
-import os, re, io, csv, json, time, random, logging, zipfile, threading, sqlite3
-import requests as http_requests
-from datetime import datetime, timedelta
+import os
+import io
+import json
+import time
+import zipfile
+import logging
+import tempfile
+import datetime
+import threading
+import traceback
 from collections import defaultdict
 
-from flask import Flask, request
 import telebot
-from telebot import types
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji
+from flask import Flask, request
 from openai import OpenAI
 
-# ── Optional libraries ───────────────────────────────────────────
-try:
-    import PyPDF2
-    HAS_PDF = True
-except ImportError:
-    HAS_PDF = False
+# ─── ENV VARS ───────────────────────────────────────────────────────────────
+BOT_TOKEN  = os.environ["BOT_TOKEN"]
+API_KEY    = os.environ["API_KEY"]          # your sk-nara-... key
+BASE_URL   = os.environ.get("BASE_URL", "https://router.bynara.id/v1")
+MODEL      = os.environ.get("MODEL", "auto/bynara")
+ADMIN_IDS  = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 
-try:
-    from docx import Document as DocxDocument
-    HAS_DOCX = True
-except ImportError:
-    HAS_DOCX = False
+# ─── INIT ────────────────────────────────────────────────────────────────────
+bot    = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+app    = Flask(__name__)
 
-try:
-    import openpyxl
-    HAS_EXCEL = True
-except ImportError:
-    HAS_EXCEL = False
-
-try:
-    import speech_recognition as sr
-    from pydub import AudioSegment
-    HAS_VOICE = True
-except ImportError:
-    HAS_VOICE = False
-
-# ── Logging ──────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Environment Variables ────────────────────────────────────────
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
-NARA_TOKEN = os.environ.get("NARA_TOKEN", "")
-ADMIN_IDS  = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not set!")
-if not NARA_TOKEN:
-    raise RuntimeError("NARA_TOKEN not set!")
-
-# ── Clients ──────────────────────────────────────────────────────
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
-
-ai_client = OpenAI(
-    base_url="https://router.bynara.id/v1",
-    api_key=NARA_TOKEN,
-)
-
-MODEL      = "auto/bynara"
-MAX_TOKENS = 1500
-
-# ================================================================
-#  DATABASE  — SQLite for persistent memory
-# ================================================================
-DB_PATH = "/tmp/bot_memory.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c    = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id     INTEGER PRIMARY KEY,
-            name        TEXT,
-            first_seen  TEXT,
-            msg_count   INTEGER DEFAULT 0,
-            tokens_used INTEGER DEFAULT 0,
-            language    TEXT DEFAULT 'auto',
-            mode        TEXT DEFAULT 'normal'
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER,
-            role       TEXT,
-            content    TEXT,
-            created_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS summaries (
-            user_id    INTEGER PRIMARY KEY,
-            summary    TEXT,
-            updated_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS analytics (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS errors (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER,
-            error      TEXT,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def db():
-    return sqlite3.connect(DB_PATH)
-
-# ── User DB helpers ──────────────────────────────────────────────
-def ensure_user(user_id, name=""):
-    with db() as conn:
-        today = datetime.now().strftime("%Y-%m-%d")
-        conn.execute("""
-            INSERT INTO users (user_id, name, first_seen, msg_count, tokens_used)
-            VALUES (?, ?, ?, 0, 0)
-            ON CONFLICT(user_id) DO UPDATE SET name=excluded.name
-        """, (user_id, name, today))
-        conn.commit()
-
-def get_user(user_id):
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    if not row:
-        return None
-    cols = ["user_id","name","first_seen","msg_count","tokens_used","language","mode"]
-    return dict(zip(cols, row))
-
-def update_user_stat(user_id, msg_count_delta=0, tokens_delta=0):
-    with db() as conn:
-        conn.execute("""
-            UPDATE users SET
-                msg_count   = msg_count   + ?,
-                tokens_used = tokens_used + ?
-            WHERE user_id = ?
-        """, (msg_count_delta, tokens_delta, user_id))
-        conn.commit()
-
-def set_user_mode(user_id, mode):
-    with db() as conn:
-        conn.execute("UPDATE users SET mode=? WHERE user_id=?", (mode, user_id))
-        conn.commit()
-
-def set_user_language(user_id, lang):
-    with db() as conn:
-        conn.execute("UPDATE users SET language=? WHERE user_id=?", (lang, user_id))
-        conn.commit()
-
-# ── Message history (persistent) ────────────────────────────────
-HISTORY_LIMIT    = 40   # messages kept in DB per user
-SUMMARY_AFTER    = 30   # summarize when history exceeds this
-
-def save_message(user_id, role, content):
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO messages (user_id, role, content, created_at) VALUES (?,?,?,?)",
-            (user_id, role, content[:4000], datetime.now().isoformat())
-        )
-        conn.commit()
-        # Trim old messages
-        conn.execute("""
-            DELETE FROM messages WHERE id IN (
-                SELECT id FROM messages WHERE user_id=?
-                ORDER BY id DESC LIMIT -1 OFFSET ?
-            )
-        """, (user_id, HISTORY_LIMIT))
-        conn.commit()
-
-def get_history(user_id):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT role, content FROM messages WHERE user_id=? ORDER BY id ASC",
-            (user_id,)
-        ).fetchall()
-    return [{"role": r, "content": c} for r, c in rows]
-
-def clear_history(user_id):
-    with db() as conn:
-        conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM summaries WHERE user_id=?", (user_id,))
-        conn.commit()
-
-def save_summary(user_id, summary):
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO summaries (user_id, summary, updated_at) VALUES (?,?,?)
-            ON CONFLICT(user_id) DO UPDATE SET summary=excluded.summary, updated_at=excluded.updated_at
-        """, (user_id, summary, datetime.now().isoformat()))
-        conn.commit()
-
-def get_summary(user_id):
-    with db() as conn:
-        row = conn.execute("SELECT summary FROM summaries WHERE user_id=?", (user_id,)).fetchone()
-    return row[0] if row else None
-
-# ── Analytics DB ─────────────────────────────────────────────────
-_analytics_cache = {
-    "total_messages": 0,
-    "total_tokens":   0,
-    "response_times": [],
-    "daily_messages": defaultdict(int),
-    "active_today":   set(),
+# ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
+# Long-term memory: user_id → list of {role, content} (full history, trimmed)
+memory: dict[int, list[dict]] = defaultdict(list)
+# Summaries for old context
+summaries: dict[int, str] = {}
+# Stats
+stats = {
     "total_users":    set(),
-    "model_calls":    0,
-    "errors_count":   0,
+    "active_today":   set(),
+    "daily_messages": defaultdict(int),
+    "token_usage":    defaultdict(int),
+    "response_times": [],
+    "errors":         [],
+    "model_usage":    defaultdict(int),
+    "user_messages":  defaultdict(int),   # leaderboard
+}
+# Pending "continue" responses (user_id → leftover text)
+pending_continue: dict[int, str] = {}
+
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+SUPPORTED_LANGS = {
+    "en":"English","ur":"Urdu","hi":"Hindi","ar":"Arabic","fr":"French",
+    "de":"German","es":"Spanish","it":"Italian","pt":"Portuguese","ru":"Russian",
+    "zh":"Chinese","ja":"Japanese","ko":"Korean","tr":"Turkish","nl":"Dutch",
+    "pl":"Polish","sv":"Swedish","da":"Danish","fi":"Finnish","no":"Norwegian",
+    "bn":"Bengali","pa":"Punjabi","fa":"Persian","id":"Indonesian","ms":"Malay",
+    "th":"Thai","vi":"Vietnamese","ro":"Romanian","hu":"Hungarian","cs":"Czech",
 }
 
-def track_analytics(user_id, tokens=0, response_time=0.0):
-    today = datetime.now().strftime("%Y-%m-%d")
-    _analytics_cache["total_messages"]    += 1
-    _analytics_cache["total_tokens"]      += tokens
-    _analytics_cache["model_calls"]       += 1
-    _analytics_cache["daily_messages"][today] += 1
-    _analytics_cache["active_today"].add(user_id)
-    _analytics_cache["total_users"].add(user_id)
-    if response_time:
-        _analytics_cache["response_times"].append(round(response_time, 3))
-        _analytics_cache["response_times"] = _analytics_cache["response_times"][-500:]
+MAX_HISTORY   = 20          # messages kept per user before summarising
+MAX_TG_LENGTH = 4000        # Telegram message char limit (safe)
 
-def log_error(user_id, error):
-    _analytics_cache["errors_count"] += 1
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO errors (user_id, error, created_at) VALUES (?,?,?)",
-            (user_id, str(error)[:300], datetime.now().isoformat())
-        )
-        conn.commit()
 
-def get_errors(limit=10):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT user_id, error, created_at FROM errors ORDER BY id DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-    return rows
+def today_str():
+    return datetime.date.today().isoformat()
 
-def get_leaderboard(limit=10):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT user_id, name, msg_count, tokens_used FROM users ORDER BY msg_count DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-    return rows
 
-def get_all_users():
-    with db() as conn:
-        rows = conn.execute("SELECT user_id FROM users").fetchall()
-    return [r[0] for r in rows]
+def record_stat(user_id: int, tokens: int = 0, resp_time: float = 0):
+    stats["total_users"].add(user_id)
+    stats["active_today"].add(user_id)
+    stats["daily_messages"][today_str()] += 1
+    stats["token_usage"][today_str()] += tokens
+    stats["user_messages"][user_id] += 1
+    if resp_time:
+        stats["response_times"].append(resp_time)
+    stats["model_usage"][MODEL] += 1
 
-# ================================================================
-#  SYSTEM PROMPTS
-# ================================================================
-BASE_SYSTEM = """You are an advanced, helpful AI assistant inside a Telegram bot.
 
-STRICT FORMATTING:
-- NEVER use # ## ### headings
-- Bold key words: <b>word</b>
-- Lists: start lines with -
-- Code: <code>code</code>
-- Be concise, clear, and friendly
-- Always respond in the same language the user writes in
-"""
+def log_error(user_id: int, err: str):
+    stats["errors"].append({
+        "time": datetime.datetime.utcnow().isoformat(),
+        "user": user_id,
+        "error": err,
+    })
+    logger.error("[Error uid=%s] %s", user_id, err)
 
-MODE_PROMPTS = {
-    "normal":    "",
-    "translate": "Translate every message to English. Always identify the source language at the start.",
-    "summarize": "Summarize every message in 3-5 bullet points maximum. Be very concise.",
-    "code":      "You are a senior developer. Analyze code, fix bugs, explain clearly. Format code with <code> tags.",
-    "essay":     "Help write, improve, and proofread essays. Give structured, clear feedback.",
-    "creative":  "You are a creative writing assistant. Help with stories, poems, scripts, and creative content.",
-}
 
-SUMMARY_PROMPT = """Summarize this conversation in 3-5 sentences capturing the main topics, 
-key information shared, and important context. Be brief but complete:
-
-{history}"""
-
-# ================================================================
-#  REACTIONS  — Telegram-verified emoji list only
-# ================================================================
-
-# These are the ONLY emojis Telegram officially supports as reactions
-# Using actual unicode characters (not escape codes) for max compatibility
-TELEGRAM_REACTIONS = [
-    "👍",  # thumbs up
-    "👎",  # thumbs down
-    "❤",      # red heart
-    "🔥",  # fire
-    "🥺",  # pleading face
-    "💯",  # 100
-    "👏",  # clapping
-    "🤔",  # thinking
-    "😂",  # laughing
-    "😮",  # open mouth
-    "🤨",  # raised eyebrow
-    "👌",  # ok hand
-    "🖕",  # middle finger (not used but valid)
-    "💩",  # poop
-    "🙏",  # folded hands / pray
-    "🤡",  # clown
-    "💥",  # collision / exploding head
-    "💨",  # dashing away
-    "🙌",  # raising hands
-    "👀",  # eyes
-    "💦",  # droplets
-    "🎊",  # confetti ball
-    "💫",  # dizzy
-    "💤",  # zzz
-    "😈",  # smiling devil
-    "📈",  # chart up
-    "📉",  # chart down
-    "✅",      # check mark
-    "❌",      # cross mark
-    "❗",      # exclamation
-    "❓",      # question mark
-    "💡",  # light bulb
-    "📢",  # loudspeaker
-    "🏆",  # trophy
-    "📄",  # document
-    "🎵",  # music note
-    "💰",  # money bag
-    "💣",  # bomb
-    "🤝",  # handshake
-    "📳",  # vibration mode
-]
-
-# Smart reaction rules — keyword → emoji
-REACTION_RULES = [
-    # Greetings
-    (["hello","hi","hey","namaste","salam","hola","bonjour","salut","ciao",
-      "assalam","adaab","good morning","good evening","good night",
-      "subah","shaam","raat"],
-     "👍"),
-
-    # Thanks / Gratitude
-    (["thank","thanks","shukriya","dhanyawad","ty","tysm","grateful",
-      "appreciate","meherbani","shukar"],
-     "🙏"),
-
-    # Love / Positive emotion
-    (["love","pyar","cute","beautiful","amazing","awesome","wonderful",
-      "fantastic","excellent","great","best","superb","brilliant"],
-     "❤"),
-
-    # Funny / Jokes
-    (["funny","lol","haha","hehe","joke","maza","mazak","comedy",
-      "laughing","hilarious","rofl","lmao"],
-     "😂"),
-
-    # Sad / Emotional
-    (["sad","dukh","cry","upset","depressed","bura","hurt","pain",
-      "heartbreak","lonely","missing","yaad"],
-     "🥺"),
-
-    # Wow / Surprise
-    (["wow","incredible","unbelievable","shocking","omg","surprised",
-      "whoa","OMG","shocking","mindblowing"],
-     "😮"),
-
-    # Code / Tech
-    (["code","coding","python","javascript","java","script","function",
-      "debug","program","developer","git","api","server","database",
-      "html","css","bug","error","exception","stack"],
-     "💥"),
-
-    # File / Document
-    (["pdf","docx","file","document","upload","excel","csv","zip",
-      "read","extract","analyze","spreadsheet"],
-     "📄"),
-
-    # Music
-    (["music","song","gaana","listen","playlist","singer","album",
-      "guitar","piano","beats","rhythm"],
-     "🎵"),
-
-    # Money / Finance
-    (["money","paisa","rupee","dollar","payment","price","cost",
-      "salary","invest","profit","loss","bank","finance"],
-     "💰"),
-
-    # Ideas / Creative
-    (["idea","suggest","plan","concept","creative","think","thought",
-      "solution","strategy","invent","innovate"],
-     "💡"),
-
-    # Yes / Correct
-    (["yes","correct","right","haan","bilkul","sure","absolutely",
-      "exactly","perfect","agreed","confirmed","done","sahi"],
-     "✅"),
-
-    # No / Wrong
-    (["no","nahi","galat","wrong","incorrect","nope","never","false",
-      "disagree","denied","rejected"],
-     "❌"),
-
-    # News / Updates
-    (["news","update","latest","breaking","trending","report","announcement",
-      "launched","released","new"],
-     "📢"),
-
-    # Sports / Games
-    (["cricket","football","sports","game","match","score","win","lose",
-      "team","player","tournament","championship"],
-     "🏆"),
-
-    # Questions / Confusion
-    (["kya","what","why","how","when","where","who","confused",
-      "samajh","bata","explain","matlab","means"],
-     "🤔"),
-
-    # Voice / Audio
-    (["voice","audio","sound","mic","record","speech","listen"],
-     "📳"),
-
-    # Fire / Trending
-    (["fire","hot","viral","trending","epic","lit","savage"],
-     "🔥"),
-]
-
-# Context-specific reactions for commands/events
-CMD_REACTIONS = {
-    "start":      "👍",
-    "help":       "💡",
-    "clear":      "✅",
-    "stats":      "📈",
-    "leaderboard":"🏆",
-    "translate":  "📢",
-    "summarize":  "📄",
-    "ask":        "🤔",
-    "mode":       "💡",
-    "memory":     "👀",
-    "admin":      "🔥",
-    "broadcast":  "📢",
-    "file":       "📄",
-    "voice":      "🎵",
-    "photo":      "👀",
-    "error":      "💣",
-    "success":    "✅",
-    "ban":        "❌",
-    "mute":       "❌",
-    "pin":        "📢",
-}
-
-def pick_reaction(text):
-    """Smart reaction based on message content."""
-    low = text.lower()
-    for keywords, emoji in REACTION_RULES:
-        if any(k in low for k in keywords):
-            return emoji
-    # Random from friendly set
-    friendly = ["👍", "🔥", "💯", "🙏",
-                "🤔", "👀", "🎊", "✅"]
-    return random.choice(friendly)
-
-def react(chat_id, message_id, emoji):
-    """
-    Send reaction using raw Telegram Bot API.
-    Most reliable method — bypasses pyTelegramBotAPI wrapper issues.
-    """
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMessageReaction"
-    try:
-        r = http_requests.post(url, json={
-            "chat_id":    chat_id,
-            "message_id": message_id,
-            "reaction":   [{"type": "emoji", "emoji": emoji}],
-            "is_big":     False,
-        }, timeout=5)
-        data = r.json()
-        if not data.get("ok"):
-            desc = data.get("description", "")
-            logger.debug(f"Reaction failed: {desc}")
-            # Try fallback thumbs up if emoji invalid
-            if "REACTION_INVALID" in desc or "invalid" in desc.lower():
-                http_requests.post(url, json={
-                    "chat_id":    chat_id,
-                    "message_id": message_id,
-                    "reaction":   [{"type": "emoji", "emoji": "\U0001f44d"}],
-                    "is_big":     False,
-                }, timeout=5)
-    except Exception as e:
-        logger.debug(f"Reaction error: {e}")
-
-# Alias for backward compatibility
-def send_reaction(chat_id, message_id, emoji):
-    react(chat_id, message_id, emoji)
-
-# ================================================================
-#  FORMATTING
-# ================================================================
-def format_for_telegram(text):
-    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"```(?:\w+)?\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
-    text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
-    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
-    return text.strip()
-
-def safe_send(chat_id, text, reply_to=None, kb=None):
-    if not text or not text.strip():
-        text = "..."
-    # Telegram max message length is 4096
-    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-    for i, chunk in enumerate(chunks):
-        kwargs = {"parse_mode": "HTML"}
-        if reply_to and i == 0:
-            kwargs["reply_to_message_id"] = reply_to
-        if kb and i == len(chunks) - 1:
-            kwargs["reply_markup"] = kb
-        try:
-            bot.send_message(chat_id, chunk, **kwargs)
-        except Exception:
-            plain = re.sub(r"<[^>]+>", "", chunk)
-            try:
-                bot.send_message(chat_id, plain,
-                    reply_to_message_id=(reply_to if i == 0 else None),
-                    reply_markup=(kb if i == len(chunks)-1 else None))
-            except Exception as e:
-                logger.error(f"safe_send failed: {e}")
-
-def send_typing(chat_id):
-    try:
-        bot.send_chat_action(chat_id, "typing")
-    except Exception:
-        pass
-
-# ================================================================
-#  AI CORE  —  with long-term memory + auto summary
-# ================================================================
-
-# In-memory last response store for "continue" button
-last_responses = {}
-
-def maybe_summarize(user_id):
-    """If history is long, auto-summarize older messages to save context."""
-    history = get_history(user_id)
-    if len(history) < SUMMARY_AFTER:
-        return
-    # Summarize
-    hist_text = "\n".join([f"{m['role'].upper()}: {m['content'][:300]}" for m in history[:-10]])
-    try:
-        resp = ai_client.chat.completions.create(
-            model=MODEL,
-            messages=[{
-                "role": "user",
-                "content": SUMMARY_PROMPT.format(history=hist_text)
-            }],
-            max_tokens=300,
-        )
-        summary = resp.choices[0].message.content.strip()
-        save_summary(user_id, summary)
-        # Keep only last 10 messages
-        with db() as conn:
-            ids = conn.execute(
-                "SELECT id FROM messages WHERE user_id=? ORDER BY id DESC LIMIT 10",
-                (user_id,)
-            ).fetchall()
-            if ids:
-                keep_ids = [str(r[0]) for r in ids]
-                conn.execute(
-                    f"DELETE FROM messages WHERE user_id=? AND id NOT IN ({','.join(keep_ids)})",
-                    (user_id,)
-                )
-            conn.commit()
-        logger.info(f"Summarized history for user {user_id}")
-    except Exception as e:
-        logger.warning(f"Summary failed: {e}")
-
-def get_ai_response(user_id, user_message, extra_system="", save_to_history=True):
-    user = get_user(user_id)
-    mode = user["mode"] if user else "normal"
-
-    if save_to_history:
-        save_message(user_id, "user", user_message)
-
-    # Trigger summarization if needed
-    threading.Thread(target=maybe_summarize, args=(user_id,), daemon=True).start()
-
-    history = get_history(user_id)
-
-    # Build system prompt
-    system = BASE_SYSTEM
-    if mode in MODE_PROMPTS and MODE_PROMPTS[mode]:
-        system += f"\n\nCURRENT MODE: {MODE_PROMPTS[mode]}"
-    if extra_system:
-        system += f"\n\n{extra_system}"
-
-    # Add long-term summary as context
-    summary = get_summary(user_id)
-    if summary:
-        system += f"\n\nCONVERSATION SUMMARY (previous context):\n{summary}"
-
-    messages = [{"role": "system", "content": system}] + history
-    t0 = time.time()
-
-    try:
-        logger.info(f"AI call: user={user_id} mode={mode} history={len(history)}")
-        resp = ai_client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-            temperature=0.7,
-        )
-        reply  = resp.choices[0].message.content.strip()
-        tokens = getattr(resp.usage, "total_tokens", 0)
-        rt     = time.time() - t0
-
-        if save_to_history:
-            save_message(user_id, "assistant", reply)
-
-        update_user_stat(user_id, msg_count_delta=1, tokens_delta=tokens)
-        track_analytics(user_id, tokens=tokens, response_time=rt)
-
-        # Store last response for "continue" button
-        last_responses[user_id] = {
-            "last_reply": reply,
-            "messages":   messages + [{"role": "assistant", "content": reply}],
-        }
-
-        logger.info(f"AI done: tokens={tokens} time={rt:.2f}s")
-        return reply
-
-    except Exception as e:
-        err = str(e)
-        log_error(user_id, err)
-        logger.error(f"AI error user={user_id}: {type(e).__name__}: {err}")
-
-        if "401" in err or "unauthorized" in err.lower():
-            return "NARA_TOKEN invalid or expired. Please check your API key in Render environment variables."
-        elif "429" in err or "rate" in err.lower():
-            return "Too many requests. Please wait a moment and try again."
-        elif "timeout" in err.lower():
-            return "Request timed out. Please try again."
-        elif "404" in err:
-            return "AI model not found. Please contact admin."
-        else:
-            return f"AI Error: {err[:200]}\n\nPlease try again."
-
-def continue_response(user_id):
-    """Continue generating from where last response ended."""
-    if user_id not in last_responses:
-        return "No previous response to continue."
-    data     = last_responses[user_id]
-    messages = data["messages"] + [{"role": "user", "content": "Please continue from where you left off."}]
-    try:
-        resp   = ai_client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-            temperature=0.7,
-        )
-        reply  = resp.choices[0].message.content.strip()
-        tokens = getattr(resp.usage, "total_tokens", 0)
-        save_message(user_id, "assistant", f"[Continued] {reply}")
-        update_user_stat(user_id, tokens_delta=tokens)
-        track_analytics(user_id, tokens=tokens)
-        last_responses[user_id]["messages"].append({"role": "assistant", "content": reply})
-        return reply
-    except Exception as e:
-        return f"Continue failed: {e}"
-
-# ================================================================
-#  FILE PARSERS
-# ================================================================
-def parse_pdf(data):
-    if not HAS_PDF:
-        return "[PyPDF2 not installed]"
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(data))
-        pages  = [p.extract_text() or "" for p in reader.pages[:20]]
-        return "\n".join(pages).strip()[:12000] or "[No text extracted from PDF]"
-    except Exception as e:
-        return f"[PDF error: {e}]"
-
-def parse_docx(data):
-    if not HAS_DOCX:
-        return "[python-docx not installed]"
-    try:
-        doc   = DocxDocument(io.BytesIO(data))
-        lines = [p.text for p in doc.paragraphs if p.text.strip()]
-        return "\n".join(lines)[:12000]
-    except Exception as e:
-        return f"[DOCX error: {e}]"
-
-def parse_excel(data):
-    if not HAS_EXCEL:
-        return "[openpyxl not installed]"
-    try:
-        wb     = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
-        result = []
-        for sheet in wb.sheetnames[:3]:
-            ws   = wb[sheet]
-            rows = list(ws.iter_rows(values_only=True))[:60]
-            result.append(f"Sheet: {sheet}")
-            for row in rows:
-                result.append("\t".join(str(c) if c is not None else "" for c in row))
-        return "\n".join(result)[:10000]
-    except Exception as e:
-        return f"[Excel error: {e}]"
-
-def parse_csv(data):
-    try:
-        text = data.decode("utf-8", errors="replace")
-        rows = list(csv.reader(io.StringIO(text)))[:100]
-        return f"CSV ({len(rows)} rows shown):\n" + "\n".join([",".join(r) for r in rows])
-    except Exception as e:
-        return f"[CSV error: {e}]"
-
-def parse_json_file(data):
-    try:
-        obj = json.loads(data.decode("utf-8", errors="replace"))
-        return json.dumps(obj, indent=2, ensure_ascii=False)[:10000]
-    except Exception as e:
-        return f"[JSON error: {e}]"
-
-def parse_zip(data):
-    try:
-        result = []
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            names = zf.namelist()
-            result.append(f"ZIP Archive: {len(names)} files\n")
-            for name in names[:30]:
-                info = zf.getinfo(name)
-                result.append(f"  - {name}  ({info.file_size:,} bytes)")
-            for name in names[:5]:
-                if any(name.endswith(e) for e in [".txt",".py",".js",".md",".json",".csv"]):
-                    try:
-                        content = zf.read(name).decode("utf-8", errors="replace")[:2000]
-                        result.append(f"\n--- {name} ---\n{content}")
-                    except Exception:
-                        pass
-        return "\n".join(result)[:10000]
-    except Exception as e:
-        return f"[ZIP error: {e}]"
-
-CODE_EXTS = {
-    ".py",".js",".ts",".java",".cpp",".c",".cs",".go",
-    ".rb",".php",".swift",".kt",".rs",".html",".css",
-    ".sh",".bash",".yaml",".yml",".toml",".xml",".sql",
-    ".r",".m",".pl",".lua",".dart",".ex",".exs",
-}
-
-def parse_file(data, filename):
-    ext = os.path.splitext(filename.lower())[1]
-    if ext == ".pdf":                    return parse_pdf(data),        "PDF Document"
-    elif ext in (".docx",".doc"):        return parse_docx(data),       "Word Document"
-    elif ext in (".xlsx",".xls"):        return parse_excel(data),      "Excel Spreadsheet"
-    elif ext == ".csv":                  return parse_csv(data),        "CSV File"
-    elif ext == ".json":                 return parse_json_file(data),  "JSON File"
-    elif ext == ".zip":                  return parse_zip(data),        "ZIP Archive"
-    elif ext in CODE_EXTS:
-        return data.decode("utf-8", errors="replace")[:12000], f"Code File ({ext})"
-    elif ext in (".txt",".md",".log",".text",".rst"):
-        return data.decode("utf-8", errors="replace")[:12000], "Text File"
-    else:
-        try:
-            return data.decode("utf-8", errors="replace")[:10000], f"File ({ext})"
-        except Exception:
-            return "", f"Unsupported ({ext})"
-
-# ================================================================
-#  VOICE — Speech to Text
-# ================================================================
-def transcribe_voice(file_bytes):
-    if not HAS_VOICE:
-        return None
-    try:
-        audio    = AudioSegment.from_ogg(io.BytesIO(file_bytes))
-        wav_buf  = io.BytesIO()
-        audio.export(wav_buf, format="wav")
-        wav_buf.seek(0)
-        rec      = sr.Recognizer()
-        with sr.AudioFile(wav_buf) as source:
-            audio_data = rec.record(source)
-        return rec.recognize_google(audio_data)
-    except Exception as e:
-        logger.warning(f"Transcription error: {e}")
-        return None
-
-# ================================================================
-#  LANGUAGE DETECTION
-# ================================================================
-COMMON_LANGS = {
-    "hindi": "Hindi", "urdu": "Urdu", "english": "English",
-    "spanish": "Spanish", "french": "French", "german": "German",
-    "arabic": "Arabic", "chinese": "Chinese", "japanese": "Japanese",
-    "korean": "Korean", "portuguese": "Portuguese", "russian": "Russian",
-    "italian": "Italian", "turkish": "Turkish", "dutch": "Dutch",
-    "bengali": "Bengali", "tamil": "Tamil", "telugu": "Telugu",
-    "marathi": "Marathi", "gujarati": "Gujarati", "punjabi": "Punjabi",
-}
-
-def detect_language_prompt(text):
-    """Ask AI to detect language."""
-    return f"Detect the language of this text and respond with ONLY the language name, nothing else:\n\n{text[:200]}"
-
-# ================================================================
-#  KEYBOARDS
-# ================================================================
-def main_menu_kb():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("Normal Mode",    callback_data="mode_normal"),
-        types.InlineKeyboardButton("Translate",      callback_data="mode_translate"),
-        types.InlineKeyboardButton("Summarize",      callback_data="mode_summarize"),
-        types.InlineKeyboardButton("Code Helper",    callback_data="mode_code"),
-        types.InlineKeyboardButton("Essay Mode",     callback_data="mode_essay"),
-        types.InlineKeyboardButton("Creative",       callback_data="mode_creative"),
-        types.InlineKeyboardButton("My Stats",       callback_data="my_stats"),
-        types.InlineKeyboardButton("Leaderboard",    callback_data="leaderboard"),
-        types.InlineKeyboardButton("Memory Summary", callback_data="show_summary"),
-        types.InlineKeyboardButton("Clear History",  callback_data="clear"),
-    )
-    return kb
-
-def continue_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("Continue Response", callback_data="continue"))
-    return kb
-
-def mode_kb():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("Normal",    callback_data="mode_normal"),
-        types.InlineKeyboardButton("Translate", callback_data="mode_translate"),
-        types.InlineKeyboardButton("Summarize", callback_data="mode_summarize"),
-        types.InlineKeyboardButton("Code",      callback_data="mode_code"),
-        types.InlineKeyboardButton("Essay",     callback_data="mode_essay"),
-        types.InlineKeyboardButton("Creative",  callback_data="mode_creative"),
-    )
-    return kb
-
-def translate_kb():
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    langs = ["Hindi","Urdu","English","Spanish","French","German",
-             "Arabic","Chinese","Japanese","Korean","Russian","Turkish"]
-    for lang in langs:
-        kb.add(types.InlineKeyboardButton(lang, callback_data=f"translate_to_{lang}"))
-    return kb
-
-# ================================================================
-#  FLASK
-# ================================================================
-app = Flask(__name__)
-
-@app.route("/", methods=["GET"])
-def health():
-    today = datetime.now().strftime("%Y-%m-%d")
+def get_system_prompt(lang_hint: str = "auto") -> str:
     return (
-        f"Bot running | "
-        f"Users: {len(_analytics_cache['total_users'])} | "
-        f"Messages: {_analytics_cache['total_messages']}"
-    ), 200
+        f"You are an advanced, helpful AI assistant inside Telegram. "
+        f"Detected/preferred language: {lang_hint}. "
+        "Reply in the same language the user uses. "
+        "Be concise but thorough. Use markdown formatting when helpful."
+    )
 
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
-    bot.process_new_updates([update])
-    return "OK", 200
 
-# ================================================================
-#  COMMAND HANDLERS
-# ================================================================
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+def detect_language(text: str) -> str:
+    """Very lightweight heuristic; full detection done by the model itself."""
+    if any("\u0600" <= c <= "\u06ff" for c in text):
+        return "Arabic/Urdu/Persian"
+    if any("\u0900" <= c <= "\u097f" for c in text):
+        return "Hindi"
+    if any("\u4e00" <= c <= "\u9fff" for c in text):
+        return "Chinese"
+    if any("\u3040" <= c <= "\u30ff" for c in text):
+        return "Japanese"
+    if any("\uac00" <= c <= "\ud7a3" for c in text):
+        return "Korean"
+    return "Latin-script"
 
+
+def maybe_summarise(user_id: int):
+    """If history is long, summarise old turns and reset."""
+    hist = memory[user_id]
+    if len(hist) < MAX_HISTORY:
+        return
+    to_summarise = hist[:-4]   # keep last 4 turns fresh
+    memory[user_id] = hist[-4:]
+    joined = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in to_summarise)
+    try:
+        r = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=300,
+            messages=[
+                {"role": "system", "content": "Summarise the following conversation in 3-5 sentences, keeping key facts."},
+                {"role": "user",   "content": joined},
+            ],
+        )
+        summaries[user_id] = r.choices[0].message.content.strip()
+    except Exception as e:
+        log_error(user_id, f"summarise: {e}")
+
+
+def build_messages(user_id: int, user_text: str, lang: str = "auto") -> list[dict]:
+    maybe_summarise(user_id)
+    system = get_system_prompt(lang)
+    if user_id in summaries:
+        system += f"\n\n[Earlier conversation summary]: {summaries[user_id]}"
+    messages = [{"role": "system", "content": system}]
+    messages += memory[user_id]
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+def call_ai(user_id: int, user_text: str, lang: str = "auto") -> tuple[str, int]:
+    """Returns (reply_text, tokens_used)."""
+    messages = build_messages(user_id, user_text, lang)
+    t0 = time.time()
+    try:
+        r = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=2000,
+            messages=messages,
+        )
+        reply  = r.choices[0].message.content.strip()
+        tokens = r.usage.total_tokens if r.usage else 0
+        record_stat(user_id, tokens, time.time() - t0)
+        # Store in memory
+        memory[user_id].append({"role": "user",      "content": user_text})
+        memory[user_id].append({"role": "assistant",  "content": reply})
+        return reply, tokens
+    except Exception as e:
+        log_error(user_id, traceback.format_exc())
+        raise e
+
+
+def send_long(chat_id: int, text: str, reply_to: int | None = None, user_id: int | None = None):
+    """Send text, chunking if needed, with a 'Continue' button for very long replies."""
+    if len(text) <= MAX_TG_LENGTH:
+        bot.send_message(chat_id, text, reply_to_message_id=reply_to)
+        return
+    # Split at MAX_TG_LENGTH
+    chunk   = text[:MAX_TG_LENGTH]
+    leftover = text[MAX_TG_LENGTH:]
+    if user_id:
+        pending_continue[user_id] = leftover
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("▶️ Continue", callback_data="continue_response"))
+    bot.send_message(chat_id, chunk, reply_to_message_id=reply_to, reply_markup=kb)
+
+
+def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
+    """Extract text from various file types."""
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    if ext == "txt":
+        return file_bytes.decode("utf-8", errors="ignore")
+
+    if ext == "json":
+        try:
+            obj = json.loads(file_bytes)
+            return json.dumps(obj, indent=2, ensure_ascii=False)
+        except Exception:
+            return file_bytes.decode("utf-8", errors="ignore")
+
+    if ext == "csv":
+        import csv
+        text = file_bytes.decode("utf-8", errors="ignore")
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        preview = f"CSV File: {filename}\nRows: {len(rows)}, Cols: {len(rows[0]) if rows else 0}\n\n"
+        preview += "\n".join([", ".join(r) for r in rows[:20]])
+        if len(rows) > 20:
+            preview += f"\n... ({len(rows)-20} more rows)"
+        return preview
+
+    if ext in ("xls", "xlsx"):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+            out = []
+            for sheet in wb.sheetnames:
+                ws = wb[sheet]
+                out.append(f"## Sheet: {sheet}")
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    if i > 50: out.append("... (truncated)"); break
+                    out.append("\t".join([str(c) if c is not None else "" for c in row]))
+            return "\n".join(out)
+        except Exception as e:
+            return f"[Could not parse Excel: {e}]"
+
+    if ext == "pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+            pages = []
+            for i, page in enumerate(reader.pages[:15]):
+                pages.append(f"[Page {i+1}]\n{page.extract_text()}")
+                if i >= 14:
+                    pages.append("... (truncated to 15 pages)")
+                    break
+            return "\n\n".join(pages)
+        except Exception as e:
+            return f"[Could not parse PDF: {e}]"
+
+    if ext in ("doc", "docx"):
+        try:
+            import docx
+            doc = docx.Document(io.BytesIO(file_bytes))
+            return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        except Exception as e:
+            return f"[Could not parse DOCX: {e}]"
+
+    if ext == "zip":
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(file_bytes))
+            names = zf.namelist()
+            out = [f"ZIP Contents ({len(names)} files):"]
+            for n in names[:30]:
+                out.append(f"  • {n}")
+            if len(names) > 30:
+                out.append(f"  ... ({len(names)-30} more)")
+            # Try to read text files inside
+            text_files = [n for n in names if n.endswith((".txt",".py",".js",".json",".md",".csv"))][:5]
+            for tf in text_files:
+                content = zf.read(tf).decode("utf-8", errors="ignore")[:500]
+                out.append(f"\n--- {tf} ---\n{content}")
+            return "\n".join(out)
+        except Exception as e:
+            return f"[Could not read ZIP: {e}]"
+
+    # Code files
+    code_exts = {"py","js","ts","java","c","cpp","cs","go","rb","php","html","css","sh","yaml","yml","toml","ini","xml","md","rs","kt","swift"}
+    if ext in code_exts:
+        return file_bytes.decode("utf-8", errors="ignore")[:4000]
+
+    return f"[Unsupported file type: .{ext}]"
+
+
+# ─── REACTIONS ───────────────────────────────────────────────────────────────
+REACTIONS = ["👍", "🔥", "🤩", "💯", "🎉"]
+
+def add_reaction(chat_id: int, message_id: int, emoji: str = "👍"):
+    try:
+        bot.set_message_reaction(chat_id, message_id, [ReactionTypeEmoji(emoji)])
+    except Exception:
+        pass  # Reactions may not be supported in all chats
+
+
+# ─── COMMAND HANDLERS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
-    uid  = msg.from_user.id
-    name = msg.from_user.first_name or "there"
-    ensure_user(uid, name)
-    react(msg.chat.id, msg.message_id, CMD_REACTIONS["start"])
-    text = (
-        f"Hello <b>{name}!</b>\n\n"
-        "I am your <b>Advanced AI Assistant</b>.\n\n"
-        "<b>What I can do:</b>\n"
-        "- Answer <b>unlimited questions</b> with full memory\n"
-        "- Remember <b>all your conversations</b> across sessions\n"
-        "- Read <b>PDF, DOCX, Excel, CSV, JSON, ZIP</b> files\n"
-        "- <b>Translate</b> text in 100+ languages\n"
-        "- <b>Voice messages</b> to text\n"
-        "- <b>Summarize</b> long content\n"
-        "- <b>Code</b> help and debugging\n"
-        "- <b>Creative</b> writing\n\n"
-        "Select a mode below or just start typing!"
+    stats["total_users"].add(msg.from_user.id)
+    add_reaction(msg.chat.id, msg.message_id, "👋")
+    bot.reply_to(msg,
+        "🤖 *Welcome to AI Assistant Bot!*\n\n"
+        "I can help you with:\n"
+        "📄 File analysis (PDF, DOCX, TXT, CSV, Excel, JSON, ZIP, Code)\n"
+        "🎤 Voice messages\n"
+        "🌍 100+ language translation\n"
+        "🧠 Long-term memory\n"
+        "💬 Smart conversations\n\n"
+        "Just send me a message, file, or voice note!\n\n"
+        "Commands: /help /stats /clear /translate /admin"
     )
-    bot.send_message(msg.chat.id, text, parse_mode="HTML", reply_markup=main_menu_kb())
 
 
 @bot.message_handler(commands=["help"])
 def cmd_help(msg):
-    react(msg.chat.id, msg.message_id, CMD_REACTIONS["help"])
-    text = (
-        "<b>Commands:</b>\n\n"
-        "/start - Welcome screen\n"
-        "/mode - Switch AI mode\n"
-        "/clear - Clear chat history\n"
-        "/memory - Show your memory summary\n"
-        "/stats - Your usage stats\n"
-        "/ask [question] - Quick question\n"
-        "/translate [text] - Translate text\n"
-        "/detect [text] - Detect language\n"
-        "/summarize [text] - Summarize text\n"
-        "/leaderboard - Top users\n"
-        "/setlang [language] - Set your language\n"
-        "/help - This message\n"
+    add_reaction(msg.chat.id, msg.message_id, "💡")
+    bot.reply_to(msg,
+        "*📚 Commands:*\n"
+        "/start — Welcome\n"
+        "/help — This message\n"
+        "/clear — Clear your conversation memory\n"
+        "/translate `<lang_code> <text>` — Translate text\n"
+        "/stats — Your personal stats\n"
+        "/admin — Admin panel (admins only)\n\n"
+        "*💡 Tips:*\n"
+        "• Send any file for AI analysis\n"
+        "• Send voice messages — I'll transcribe & reply\n"
+        "• I remember our full conversation history\n"
+        "• I auto-detect your language"
     )
-    if is_admin(msg.from_user.id):
-        text += (
-            "\n<b>Admin Commands:</b>\n"
-            "/admin - Admin dashboard\n"
-            "/errors - Error logs\n"
-            "/broadcast [msg] - Message all users\n"
-        )
-    bot.send_message(msg.chat.id, text, parse_mode="HTML")
-
-
-@bot.message_handler(commands=["mode"])
-def cmd_mode(msg):
-    bot.send_message(msg.chat.id, "Select AI Mode:", reply_markup=mode_kb())
 
 
 @bot.message_handler(commands=["clear"])
 def cmd_clear(msg):
     uid = msg.from_user.id
-    clear_history(uid)
-    last_responses.pop(uid, None)
-    react(msg.chat.id, msg.message_id, CMD_REACTIONS["clear"])
-    bot.send_message(msg.chat.id,
-        "History cleared! Memory reset. Fresh start.",
-        parse_mode="HTML")
+    memory[uid].clear()
+    summaries.pop(uid, None)
+    add_reaction(msg.chat.id, msg.message_id, "🗑")
+    bot.reply_to(msg, "✅ Your conversation memory has been cleared!")
 
 
-@bot.message_handler(commands=["memory"])
-def cmd_memory(msg):
-    uid     = msg.from_user.id
-    summary = get_summary(uid)
-    history = get_history(uid)
-    if summary:
-        text = f"<b>Your Memory Summary:</b>\n\n{summary}\n\n<i>({len(history)} messages in active history)</i>"
-    elif history:
-        text = f"<b>No summary yet</b> — {len(history)} messages in history.\n\nSummary is auto-generated after {SUMMARY_AFTER} messages."
-    else:
-        text = "No conversation history yet. Start chatting!"
-    bot.send_message(msg.chat.id, text, parse_mode="HTML")
+@bot.message_handler(commands=["translate"])
+def cmd_translate(msg):
+    uid = msg.from_user.id
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(msg, "Usage: `/translate <lang_code> <text>`\n\nExamples:\n`/translate fr Hello world`\n`/translate ur Good morning`\n\nAvailable: " + ", ".join(f"`{k}`={v}" for k,v in list(SUPPORTED_LANGS.items())[:10]) + " ...")
+        return
+    lang_code = parts[1].lower()
+    text      = parts[2]
+    lang_name = SUPPORTED_LANGS.get(lang_code, lang_code)
+    try:
+        reply, _ = call_ai(uid, f"Translate the following text to {lang_name}. Output ONLY the translation:\n\n{text}", lang=lang_name)
+        add_reaction(msg.chat.id, msg.message_id, "🌍")
+        bot.reply_to(msg, f"*Translation ({lang_name}):*\n{reply}")
+    except Exception as e:
+        bot.reply_to(msg, f"❌ Translation failed: {e}")
 
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(msg):
     uid  = msg.from_user.id
-    ensure_user(uid)
-    user = get_user(uid)
-    hist = get_history(uid)
-    text = (
-        "<b>Your Stats:</b>\n\n"
-        f"- Messages sent: <b>{user['msg_count']}</b>\n"
-        f"- Tokens used: <b>{user['tokens_used']:,}</b>\n"
-        f"- Using since: <b>{user['first_seen']}</b>\n"
-        f"- Current mode: <b>{user['mode'].capitalize()}</b>\n"
-        f"- Language: <b>{user['language']}</b>\n"
-        f"- History: <b>{len(hist)} messages</b>"
+    msgs = stats["user_messages"].get(uid, 0)
+    add_reaction(msg.chat.id, msg.message_id, "📊")
+    bot.reply_to(msg,
+        f"*📊 Your Stats:*\n"
+        f"Messages sent: {msgs}\n"
+        f"Memory turns: {len(memory.get(uid, []))}\n"
+        f"Has summary: {'Yes' if uid in summaries else 'No'}"
     )
-    bot.send_message(msg.chat.id, text, parse_mode="HTML")
 
 
-@bot.message_handler(commands=["leaderboard"])
-def cmd_leaderboard(msg):
-    top    = get_leaderboard(10)
-    medals = ["1st","2nd","3rd"] + [f"{i}th" for i in range(4,11)]
-    rows   = ["<b>Top Users:</b>\n"]
-    for i, (uid, name, count, tokens) in enumerate(top):
-        display = name or f"User{uid}"
-        rows.append(f"{medals[i]} {display} - <b>{count}</b> msgs ({tokens:,} tokens)")
-    bot.send_message(msg.chat.id, "\n".join(rows), parse_mode="HTML")
-
-
-@bot.message_handler(commands=["ask"])
-def cmd_ask(msg):
-    q = msg.text.partition(" ")[2].strip()
-    if not q:
-        bot.send_message(msg.chat.id, "Usage: /ask Your question here")
-        return
-    uid = msg.from_user.id
-    ensure_user(uid, msg.from_user.first_name or "")
-    send_typing(msg.chat.id)
-    react(msg.chat.id, msg.message_id, CMD_REACTIONS["ask"])
-    reply = get_ai_response(uid, q)
-    safe_send(msg.chat.id, format_for_telegram(reply),
-              reply_to=msg.message_id, kb=continue_kb())
-
-
-@bot.message_handler(commands=["translate"])
-def cmd_translate(msg):
-    txt = msg.text.partition(" ")[2].strip()
-    if not txt:
-        bot.send_message(msg.chat.id,
-            "Usage: /translate [text]\n\nOr choose a target language:",
-            reply_markup=translate_kb())
-        return
-    uid = msg.from_user.id
-    ensure_user(uid)
-    send_typing(msg.chat.id)
-    reply = get_ai_response(uid,
-        f"Detect the language and translate to English:\n\n{txt}",
-        save_to_history=False)
-    safe_send(msg.chat.id, format_for_telegram(reply), reply_to=msg.message_id)
-
-
-@bot.message_handler(commands=["detect"])
-def cmd_detect(msg):
-    txt = msg.text.partition(" ")[2].strip()
-    if not txt:
-        bot.send_message(msg.chat.id, "Usage: /detect [text to detect language of]")
-        return
-    uid = msg.from_user.id
-    ensure_user(uid)
-    send_typing(msg.chat.id)
-    reply = get_ai_response(uid,
-        f"Detect the language of this text. Tell the language name, confidence, and any interesting details:\n\n{txt}",
-        save_to_history=False)
-    safe_send(msg.chat.id, format_for_telegram(reply), reply_to=msg.message_id)
-
-
-@bot.message_handler(commands=["summarize"])
-def cmd_summarize(msg):
-    txt = msg.text.partition(" ")[2].strip()
-    if not txt:
-        bot.send_message(msg.chat.id, "Usage: /summarize [text here]")
-        return
-    uid = msg.from_user.id
-    ensure_user(uid)
-    send_typing(msg.chat.id)
-    reply = get_ai_response(uid,
-        f"Summarize in 3-5 bullet points:\n\n{txt}",
-        save_to_history=False)
-    safe_send(msg.chat.id, format_for_telegram(reply), reply_to=msg.message_id)
-
-
-@bot.message_handler(commands=["setlang"])
-def cmd_setlang(msg):
-    lang = msg.text.partition(" ")[2].strip()
-    if not lang:
-        bot.send_message(msg.chat.id,
-            "Usage: /setlang Hindi\n\nSupported: Hindi, Urdu, English, Spanish, French, German, Arabic, Chinese, Japanese, Korean, Russian, Turkish, Bengali, Tamil, Telugu, Marathi, Gujarati, Punjabi, and 100+ more")
-        return
-    uid = msg.from_user.id
-    ensure_user(uid)
-    set_user_language(uid, lang.capitalize())
-    bot.send_message(msg.chat.id,
-        f"Language set to <b>{lang.capitalize()}</b>! I will now respond in {lang.capitalize()}.",
-        parse_mode="HTML")
-
-
-# ── ADMIN COMMANDS ───────────────────────────────────────────────
 @bot.message_handler(commands=["admin"])
 def cmd_admin(msg):
-    if not is_admin(msg.from_user.id):
-        bot.send_message(msg.chat.id, "Admin only.")
+    uid = msg.from_user.id
+    if uid not in ADMIN_IDS:
+        bot.reply_to(msg, "❌ You are not an admin.")
         return
-    today = datetime.now().strftime("%Y-%m-%d")
-    rt    = _analytics_cache["response_times"]
-    avg   = round(sum(rt)/len(rt), 2) if rt else 0
-    mn    = round(min(rt), 2) if rt else 0
-    mx    = round(max(rt), 2) if rt else 0
-    text  = (
-        "<b>Admin Dashboard:</b>\n\n"
-        f"- Total users: <b>{len(_analytics_cache['total_users'])}</b>\n"
-        f"- Active today: <b>{len(_analytics_cache['active_today'])}</b>\n"
-        f"- Total messages: <b>{_analytics_cache['total_messages']:,}</b>\n"
-        f"- Today messages: <b>{_analytics_cache['daily_messages'].get(today,0)}</b>\n"
-        f"- Total tokens: <b>{_analytics_cache['total_tokens']:,}</b>\n"
-        f"- Model: <b>{MODEL}</b>\n"
-        f"- Avg response: <b>{avg}s</b>\n"
-        f"- Fastest: <b>{mn}s</b>\n"
-        f"- Slowest: <b>{mx}s</b>\n"
-        f"- Errors: <b>{_analytics_cache['errors_count']}</b>"
+    add_reaction(msg.chat.id, msg.message_id, "🔐")
+    today = today_str()
+    avg_rt = (sum(stats["response_times"][-100:]) / max(len(stats["response_times"][-100:]), 1))
+    # Leaderboard top 5
+    lb = sorted(stats["user_messages"].items(), key=lambda x: x[1], reverse=True)[:5]
+    lb_text = "\n".join([f"  {i+1}. uid={uid}: {cnt} msgs" for i,(uid,cnt) in enumerate(lb)])
+    err_count = len(stats["errors"])
+    last_errs = stats["errors"][-3:]
+    err_text = "\n".join([f"  [{e['time']}] uid={e['user']}: {e['error'][:60]}" for e in last_errs]) or "None"
+    model_text = "\n".join([f"  {m}: {c}" for m,c in stats["model_usage"].items()]) or "None"
+    bot.reply_to(msg,
+        f"*🔐 Admin Panel*\n\n"
+        f"👥 Total users: {len(stats['total_users'])}\n"
+        f"🟢 Active today: {len(stats['active_today'])}\n"
+        f"💬 Messages today: {stats['daily_messages'].get(today, 0)}\n"
+        f"🪙 Tokens today: {stats['token_usage'].get(today, 0)}\n"
+        f"⚡ Avg response time: {avg_rt:.2f}s\n"
+        f"❌ Total errors: {err_count}\n\n"
+        f"*🏆 Leaderboard:*\n{lb_text}\n\n"
+        f"*🤖 Model usage:*\n{model_text}\n\n"
+        f"*🔴 Recent errors:*\n{err_text}"
     )
-    bot.send_message(msg.chat.id, text, parse_mode="HTML")
 
 
-@bot.message_handler(commands=["errors"])
-def cmd_errors(msg):
-    if not is_admin(msg.from_user.id):
-        bot.send_message(msg.chat.id, "Admin only.")
-        return
-    errors = get_errors(10)
-    if not errors:
-        bot.send_message(msg.chat.id, "No errors logged!")
-        return
-    rows = ["<b>Last 10 Errors:</b>\n"]
-    for uid, error, created_at in errors:
-        rows.append(f"[{created_at[:16]}] User {uid}:\n<code>{error[:100]}</code>")
-    bot.send_message(msg.chat.id, "\n\n".join(rows), parse_mode="HTML")
-
-
-@bot.message_handler(commands=["broadcast"])
-def cmd_broadcast(msg):
-    if not is_admin(msg.from_user.id):
-        bot.send_message(msg.chat.id, "Admin only.")
-        return
-    text = msg.text.partition(" ")[2].strip()
-    if not text:
-        bot.send_message(msg.chat.id, "Usage: /broadcast Your message here")
-        return
-    users = get_all_users()
-    sent  = 0
-    for uid in users:
-        try:
-            bot.send_message(uid,
-                f"<b>Announcement:</b>\n\n{text}",
-                parse_mode="HTML")
-            sent += 1
-            time.sleep(0.05)
-        except Exception:
-            pass
-    bot.send_message(msg.chat.id, f"Sent to <b>{sent}</b> users.", parse_mode="HTML")
-
-
-# ── Group Admin Tools ────────────────────────────────────────────
+# ─── GROUP ADMIN TOOLS ───────────────────────────────────────────────────────
 @bot.message_handler(commands=["ban"])
 def cmd_ban(msg):
-    if msg.chat.type == "private" or not msg.reply_to_message:
+    if not is_group_admin(msg):
         return
+    if not msg.reply_to_message:
+        bot.reply_to(msg, "Reply to a user's message to ban them.")
+        return
+    target = msg.reply_to_message.from_user.id
     try:
-        bot.ban_chat_member(msg.chat.id, msg.reply_to_message.from_user.id)
-        bot.send_message(msg.chat.id, "User banned.")
+        bot.ban_chat_member(msg.chat.id, target)
+        add_reaction(msg.chat.id, msg.message_id, "🚫")
+        bot.reply_to(msg, f"✅ User {target} has been banned.")
     except Exception as e:
-        bot.send_message(msg.chat.id, f"Cannot ban: {e}")
+        bot.reply_to(msg, f"❌ Failed: {e}")
+
 
 @bot.message_handler(commands=["unban"])
 def cmd_unban(msg):
-    if msg.chat.type == "private" or not msg.reply_to_message:
+    if not is_group_admin(msg):
         return
+    if not msg.reply_to_message:
+        bot.reply_to(msg, "Reply to a user's message to unban them.")
+        return
+    target = msg.reply_to_message.from_user.id
     try:
-        bot.unban_chat_member(msg.chat.id, msg.reply_to_message.from_user.id)
-        bot.send_message(msg.chat.id, "User unbanned.")
+        bot.unban_chat_member(msg.chat.id, target)
+        bot.reply_to(msg, f"✅ User {target} has been unbanned.")
     except Exception as e:
-        bot.send_message(msg.chat.id, f"Cannot unban: {e}")
+        bot.reply_to(msg, f"❌ Failed: {e}")
+
 
 @bot.message_handler(commands=["mute"])
 def cmd_mute(msg):
-    if msg.chat.type == "private" or not msg.reply_to_message:
+    if not is_group_admin(msg):
         return
+    if not msg.reply_to_message:
+        bot.reply_to(msg, "Reply to a user's message to mute them.")
+        return
+    target = msg.reply_to_message.from_user.id
     try:
         bot.restrict_chat_member(
-            msg.chat.id, msg.reply_to_message.from_user.id,
-            types.ChatPermissions(can_send_messages=False),
-            until_date=int(time.time()) + 3600
+            msg.chat.id, target,
+            permissions=telebot.types.ChatPermissions(can_send_messages=False),
+            until_date=int(time.time()) + 3600,   # 1 hour
         )
-        bot.send_message(msg.chat.id, "User muted for 1 hour.")
+        add_reaction(msg.chat.id, msg.message_id, "🔇")
+        bot.reply_to(msg, f"✅ User {target} muted for 1 hour.")
     except Exception as e:
-        bot.send_message(msg.chat.id, f"Cannot mute: {e}")
+        bot.reply_to(msg, f"❌ Failed: {e}")
 
-@bot.message_handler(commands=["unmute"])
-def cmd_unmute(msg):
-    if msg.chat.type == "private" or not msg.reply_to_message:
-        return
-    try:
-        bot.restrict_chat_member(
-            msg.chat.id, msg.reply_to_message.from_user.id,
-            types.ChatPermissions(
-                can_send_messages=True, can_send_media_messages=True,
-                can_send_polls=True, can_send_other_messages=True,
-            )
-        )
-        bot.send_message(msg.chat.id, "User unmuted.")
-    except Exception as e:
-        bot.send_message(msg.chat.id, f"Cannot unmute: {e}")
-
-@bot.message_handler(commands=["kick"])
-def cmd_kick(msg):
-    if msg.chat.type == "private" or not msg.reply_to_message:
-        return
-    try:
-        uid = msg.reply_to_message.from_user.id
-        bot.ban_chat_member(msg.chat.id, uid)
-        bot.unban_chat_member(msg.chat.id, uid)
-        bot.send_message(msg.chat.id, "User kicked.")
-    except Exception as e:
-        bot.send_message(msg.chat.id, f"Cannot kick: {e}")
 
 @bot.message_handler(commands=["pin"])
 def cmd_pin(msg):
-    if msg.chat.type == "private" or not msg.reply_to_message:
+    if not is_group_admin(msg):
+        return
+    if not msg.reply_to_message:
+        bot.reply_to(msg, "Reply to a message to pin it.")
         return
     try:
         bot.pin_chat_message(msg.chat.id, msg.reply_to_message.message_id)
-        bot.send_message(msg.chat.id, "Message pinned.")
+        add_reaction(msg.chat.id, msg.message_id, "📌")
     except Exception as e:
-        bot.send_message(msg.chat.id, f"Cannot pin: {e}")
+        bot.reply_to(msg, f"❌ Failed: {e}")
 
-# ================================================================
-#  CALLBACK HANDLER
-# ================================================================
-@bot.callback_query_handler(func=lambda c: True)
-def handle_callback(call):
-    uid  = call.from_user.id
-    data = call.data
-    ensure_user(uid, call.from_user.first_name or "")
 
-    # Mode switch
-    if data.startswith("mode_"):
-        mode = data[5:]
-        set_user_mode(uid, mode)
-        labels = {
-            "normal":    "Normal Mode",
-            "translate": "Translate Mode",
-            "summarize": "Summarize Mode",
-            "code":      "Code Mode",
-            "essay":     "Essay Mode",
-            "creative":  "Creative Mode",
-        }
-        label = labels.get(mode, mode.capitalize())
-        bot.answer_callback_query(call.id, f"{label} activated!")
-        safe_send(call.message.chat.id,
-            f"Switched to <b>{label}</b>! Send your message.")
+def is_group_admin(msg) -> bool:
+    try:
+        member = bot.get_chat_member(msg.chat.id, msg.from_user.id)
+        if member.status in ("administrator", "creator"):
+            return True
+        bot.reply_to(msg, "❌ You need to be an admin to use this.")
+        return False
+    except Exception:
+        return False
 
-    # Continue response
-    elif data == "continue":
-        bot.answer_callback_query(call.id, "Continuing...")
-        send_typing(call.message.chat.id)
-        reply = continue_response(uid)
-        safe_send(call.message.chat.id,
-            format_for_telegram(reply), kb=continue_kb())
 
-    # Clear history
-    elif data == "clear":
-        clear_history(uid)
-        last_responses.pop(uid, None)
-        bot.answer_callback_query(call.id, "History cleared!")
-        safe_send(call.message.chat.id, "History and memory cleared! Fresh start.")
+# ─── VOICE MESSAGES ──────────────────────────────────────────────────────────
+@bot.message_handler(content_types=["voice"])
+def handle_voice(msg):
+    uid = msg.from_user.id
+    bot.send_chat_action(msg.chat.id, "typing")
+    try:
+        file_info = bot.get_file(msg.voice.file_id)
+        voice_bytes = bot.download_file(file_info.file_path)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp.write(voice_bytes)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=("voice.ogg", f, "audio/ogg"),
+            )
+        text = transcript.text.strip()
+        os.unlink(tmp_path)
+        if not text:
+            bot.reply_to(msg, "❌ Could not transcribe the voice message.")
+            return
+        bot.reply_to(msg, f"🎤 *Transcription:*\n_{text}_")
+        lang = detect_language(text)
+        reply, _ = call_ai(uid, text, lang)
+        add_reaction(msg.chat.id, msg.message_id, "🎙")
+        send_long(msg.chat.id, reply, reply_to=msg.message_id, user_id=uid)
+    except Exception as e:
+        log_error(uid, traceback.format_exc())
+        bot.reply_to(msg, f"❌ Voice processing error: {e}")
 
-    # My stats
-    elif data == "my_stats":
-        user = get_user(uid)
-        hist = get_history(uid)
-        bot.answer_callback_query(call.id)
-        if user:
-            safe_send(call.message.chat.id,
-                f"<b>Your Stats:</b>\n\n"
-                f"- Messages: <b>{user['msg_count']}</b>\n"
-                f"- Tokens: <b>{user['tokens_used']:,}</b>\n"
-                f"- Since: <b>{user['first_seen']}</b>\n"
-                f"- Mode: <b>{user['mode'].capitalize()}</b>\n"
-                f"- Language: <b>{user['language']}</b>\n"
-                f"- History: <b>{len(hist)} msgs</b>")
 
-    # Leaderboard
-    elif data == "leaderboard":
-        top    = get_leaderboard(10)
-        medals = ["1st","2nd","3rd"] + [f"{i}th" for i in range(4,11)]
-        rows   = ["<b>Top Users:</b>\n"]
-        for i, (u, name, count, tokens) in enumerate(top):
-            display = name or f"User{u}"
-            rows.append(f"{medals[i]} {display} - <b>{count}</b> msgs")
-        bot.answer_callback_query(call.id)
-        safe_send(call.message.chat.id, "\n".join(rows))
-
-    # Show memory summary
-    elif data == "show_summary":
-        summary = get_summary(uid)
-        history = get_history(uid)
-        bot.answer_callback_query(call.id)
-        if summary:
-            safe_send(call.message.chat.id,
-                f"<b>Memory Summary:</b>\n\n{summary}\n\n<i>({len(history)} active messages)</i>")
-        else:
-            safe_send(call.message.chat.id,
-                f"No summary yet. {len(history)} messages in history.\nAuto-summary after {SUMMARY_AFTER} messages.")
-
-    # Translate to specific language
-    elif data.startswith("translate_to_"):
-        lang = data.replace("translate_to_", "")
-        bot.answer_callback_query(call.id, f"Translate to {lang} mode!")
-        safe_send(call.message.chat.id,
-            f"Now send the text you want to translate to <b>{lang}</b>.",
-            kb=None)
-        # Store pending translation target
-        last_responses[uid] = last_responses.get(uid, {})
-        last_responses[uid]["pending_translate"] = lang
-
-    else:
-        bot.answer_callback_query(call.id)
-
-# ================================================================
-#  FILE / DOCUMENT HANDLER
-# ================================================================
+# ─── DOCUMENT / FILE HANDLER ─────────────────────────────────────────────────
 @bot.message_handler(content_types=["document"])
 def handle_document(msg):
     uid      = msg.from_user.id
-    chat_id  = msg.chat.id
-    filename = msg.document.file_name or "file"
-    caption  = msg.caption or ""
-
-    ensure_user(uid, msg.from_user.first_name or "")
-    react(chat_id, msg.message_id, CMD_REACTIONS["file"])
-    send_typing(chat_id)
-    wait = bot.send_message(chat_id,
-        f"Reading <b>{filename}</b>...", parse_mode="HTML")
-
+    doc      = msg.document
+    filename = doc.file_name or "file"
+    caption  = msg.caption or f"Analyse this file: {filename}"
+    bot.send_chat_action(msg.chat.id, "upload_document")
     try:
-        file_info  = bot.get_file(msg.document.file_id)
+        file_info  = bot.get_file(doc.file_id)
         file_bytes = bot.download_file(file_info.file_path)
+        extracted  = extract_text_from_file(file_bytes, filename)
+        prompt     = f"{caption}\n\n[File: {filename}]\n\n{extracted[:6000]}"
+        lang       = detect_language(caption)
+        add_reaction(msg.chat.id, msg.message_id, "📄")
+        reply, _   = call_ai(uid, prompt, lang)
+        send_long(msg.chat.id, reply, reply_to=msg.message_id, user_id=uid)
     except Exception as e:
-        bot.edit_message_text(
-            f"Could not download: {e}", chat_id, wait.message_id)
-        return
-
-    parsed, label = parse_file(file_bytes, filename)
-    if not parsed:
-        bot.edit_message_text(
-            f"Could not read <b>{filename}</b>.",
-            chat_id, wait.message_id, parse_mode="HTML")
-        return
-
-    question = caption if caption else f"Analyze this {label} thoroughly and give a detailed summary with key insights, important data, and conclusions."
-    prompt   = f"[{label}: {filename}]\n\n{parsed[:9000]}\n\nUser request: {question}"
-
-    bot.edit_message_text(
-        f"Analyzing <b>{filename}</b>...",
-        chat_id, wait.message_id, parse_mode="HTML")
-
-    reply = get_ai_response(uid, prompt,
-        extra_system=f"User uploaded a {label} named '{filename}'. Analyze it thoroughly. Use <b>bold</b> for key points. Structure your response clearly.")
-    bot.delete_message(chat_id, wait.message_id)
-    safe_send(chat_id, format_for_telegram(reply),
-              reply_to=msg.message_id, kb=continue_kb())
+        log_error(uid, traceback.format_exc())
+        bot.reply_to(msg, f"❌ File processing error: {e}")
 
 
-# ================================================================
-#  VOICE HANDLER
-# ================================================================
-@bot.message_handler(content_types=["voice"])
-def handle_voice(msg):
-    uid     = msg.from_user.id
-    chat_id = msg.chat.id
-    ensure_user(uid, msg.from_user.first_name or "")
-    react(chat_id, msg.message_id, CMD_REACTIONS["voice"])
-
-    if not HAS_VOICE:
-        safe_send(chat_id,
-            "Voice received! Please <b>type your message</b> for now.",
-            reply_to=msg.message_id)
-        return
-
-    send_typing(chat_id)
-    wait = bot.send_message(chat_id, "Transcribing voice message...")
-    try:
-        file_info  = bot.get_file(msg.voice.file_id)
-        file_bytes = bot.download_file(file_info.file_path)
-        text       = transcribe_voice(file_bytes)
-        if text:
-            bot.edit_message_text(
-                f"<b>You said:</b> {text}", chat_id, wait.message_id,
-                parse_mode="HTML")
-            reply = get_ai_response(uid, text)
-            safe_send(chat_id, format_for_telegram(reply),
-                      reply_to=msg.message_id, kb=continue_kb())
-        else:
-            bot.edit_message_text(
-                "Could not transcribe. Please try again or type your message.",
-                chat_id, wait.message_id)
-    except Exception as e:
-        bot.edit_message_text(f"Voice error: {e}", chat_id, wait.message_id)
-
-
-# ================================================================
-#  PHOTO HANDLER
-# ================================================================
+# ─── PHOTO HANDLER ───────────────────────────────────────────────────────────
 @bot.message_handler(content_types=["photo"])
 def handle_photo(msg):
-    ensure_user(msg.from_user.id, msg.from_user.first_name or "")
-    react(msg.chat.id, msg.message_id, CMD_REACTIONS["photo"])
-    safe_send(msg.chat.id,
-        "Image received! I cannot analyze images yet.\n\nIf your image contains text, please <b>type it</b> and I will help.",
-        reply_to=msg.message_id)
+    uid     = msg.from_user.id
+    caption = msg.caption or "Describe this image."
+    bot.send_chat_action(msg.chat.id, "typing")
+    try:
+        # Get highest-res photo
+        photo     = sorted(msg.photo, key=lambda p: p.file_size)[-1]
+        file_info = bot.get_file(photo.file_id)
+        img_bytes = bot.download_file(file_info.file_path)
+        import base64
+        b64 = base64.b64encode(img_bytes).decode()
+        messages = [
+            {"role": "system", "content": get_system_prompt()},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": caption},
+            ]},
+        ]
+        r = client.chat.completions.create(model=MODEL, max_tokens=1000, messages=messages)
+        reply = r.choices[0].message.content.strip()
+        add_reaction(msg.chat.id, msg.message_id, "🖼")
+        send_long(msg.chat.id, reply, reply_to=msg.message_id, user_id=uid)
+    except Exception as e:
+        log_error(uid, traceback.format_exc())
+        bot.reply_to(msg, f"❌ Image processing error: {e}")
 
 
-# ================================================================
-#  MAIN TEXT HANDLER
-# ================================================================
-@bot.message_handler(func=lambda m: m.text and not m.text.startswith("/"))
+# ─── TEXT MESSAGE HANDLER ─────────────────────────────────────────────────────
+@bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/"))
 def handle_text(msg):
-    uid       = msg.from_user.id
-    chat_id   = msg.chat.id
-    user_text = msg.text.strip()
-
-    ensure_user(uid, msg.from_user.first_name or "")
-    logger.info(f"User {uid}: {user_text[:60]}")
-
-    send_typing(chat_id)
-    react(chat_id, msg.message_id, pick_reaction(user_text))
-
-    # Check if user has pending translate target
-    extra = ""
-    if uid in last_responses and last_responses[uid].get("pending_translate"):
-        lang = last_responses[uid].pop("pending_translate")
-        extra = f"Translate the following text to {lang}. Also mention the source language detected."
-
-    # Check user language preference
-    user = get_user(uid)
-    if user and user["language"] != "auto":
-        extra += f"\n\nAlways respond in {user['language']}."
-
-    reply     = get_ai_response(uid, user_text, extra_system=extra)
-    formatted = format_for_telegram(reply)
-    safe_send(chat_id, formatted, reply_to=msg.message_id, kb=continue_kb())
+    uid  = msg.from_user.id
+    text = msg.text.strip()
+    if not text:
+        return
+    bot.send_chat_action(msg.chat.id, "typing")
+    lang = detect_language(text)
+    try:
+        reply, _ = call_ai(uid, text, lang)
+        add_reaction(msg.chat.id, msg.message_id, "💬")
+        send_long(msg.chat.id, reply, reply_to=msg.message_id, user_id=uid)
+    except Exception as e:
+        log_error(uid, traceback.format_exc())
+        bot.reply_to(msg, f"❌ Error: {e}")
 
 
-@bot.message_handler(content_types=["sticker","video","audio","video_note"])
-def handle_other(msg):
-    safe_send(msg.chat.id,
-        "Send <b>text messages</b>, <b>voice messages</b>, or <b>files</b> (PDF, DOCX, Excel, CSV, JSON, ZIP, code files).",
-        reply_to=msg.message_id)
+# ─── CALLBACK: CONTINUE BUTTON ───────────────────────────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "continue_response")
+def cb_continue(call):
+    uid  = call.from_user.id
+    rest = pending_continue.pop(uid, None)
+    if not rest:
+        bot.answer_callback_query(call.id, "Nothing more to show.")
+        return
+    bot.answer_callback_query(call.id)
+    send_long(call.message.chat.id, rest, user_id=uid)
 
 
-# ================================================================
-#  ENTRY POINT
-# ================================================================
-if __name__ == "__main__":
-    PORT       = int(os.environ.get("PORT", 5000))
-    RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+# ─── FLASK WEBHOOK ───────────────────────────────────────────────────────────
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    update = telebot.types.Update.de_json(request.get_json())
+    bot.process_new_updates([update])
+    return "ok", 200
 
-    if RENDER_URL:
-        webhook_url = f"{RENDER_URL}/{BOT_TOKEN}"
+
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running ✅", 200
+
+
+# ─── STARTUP ─────────────────────────────────────────────────────────────────
+def set_webhook():
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if render_url:
+        url = f"{render_url}/{BOT_TOKEN}"
         bot.remove_webhook()
-        bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set: {webhook_url}")
-        app.run(host="0.0.0.0", port=PORT)
+        time.sleep(0.5)
+        bot.set_webhook(url=url)
+        logger.info("Webhook set to %s", url)
     else:
-        logger.info("Polling mode (local)...")
-        bot.remove_webhook()
+        logger.warning("RENDER_EXTERNAL_URL not set — running in polling mode")
         threading.Thread(target=bot.infinity_polling, daemon=True).start()
-        app.run(host="0.0.0.0", port=PORT)
+
+
+if __name__ == "__main__":
+    set_webhook()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
