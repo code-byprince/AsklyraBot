@@ -65,9 +65,13 @@ ai_client = OpenAI(
     api_key=HF_TOKEN,
 )
 
-MODEL          = "deepseek-ai/DeepSeek-V4-Pro:novita"
-MODEL_FALLBACK = "deepseek-ai/DeepSeek-V3-0324:fireworks-ai"
-MAX_TOKENS = 2048
+MODELS = [
+    "deepseek-ai/DeepSeek-V4-Pro:novita",
+    "deepseek-ai/DeepSeek-V4-Pro:together",
+    "deepseek-ai/DeepSeek-V3-0324:together",
+    "deepseek-ai/DeepSeek-V3-0324:fireworks-ai",
+]
+MAX_TOKENS = 1024
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  IN-MEMORY ANALYTICS & STATE
@@ -267,14 +271,14 @@ def get_ai_response(user_id: int, user_message: str, extra_system: str = "") -> 
         system += "\n\n" + extra_system
 
     messages = [{"role": "system", "content": system}] + history
-
     t0 = time.time()
-    
-    # Try primary model, then fallback
-    for attempt_model in [MODEL, MODEL_FALLBACK]:
+    last_error = ""
+
+    for model in MODELS:
         try:
+            logger.info(f"Trying model: {model}")
             resp = ai_client.chat.completions.create(
-                model=attempt_model,
+                model=model,
                 messages=messages,
                 max_tokens=MAX_TOKENS,
                 temperature=0.7,
@@ -283,27 +287,27 @@ def get_ai_response(user_id: int, user_message: str, extra_system: str = "") -> 
             tokens = getattr(resp.usage, "total_tokens", 0)
             history.append({"role": "assistant", "content": reply})
             track_tokens(tokens, user_id)
-            analytics["model_usage"][attempt_model] += 1
+            analytics["model_usage"][model] += 1
             track_response_time(time.time() - t0)
+            logger.info(f"Success with model: {model}")
             return reply
         except Exception as e:
-            err_str = str(e)
-            logger.error(f"AI error [{attempt_model}] user {user_id}: {type(e).__name__}: {err_str}")
-            if attempt_model == MODEL_FALLBACK:
-                # Both models failed — return specific error
-                track_error(user_id, err_str)
-                if "401" in err_str or "authentication" in err_str.lower() or "api key" in err_str.lower():
-                    return "❌ HF_TOKEN invalid or expired. Check your HuggingFace API token in Render environment variables."
-                elif "404" in err_str or "model" in err_str.lower():
-                    return "❌ AI model unavailable. Please try again later."
-                elif "429" in err_str or "rate" in err_str.lower():
-                    return "⏳ Too many requests. Please wait 15 seconds and try again."
-                elif "timeout" in err_str.lower() or "connection" in err_str.lower():
-                    return "⏳ Connection timeout. Please try again."
-                else:
-                    return f"❌ Error: {err_str[:200]}"
-            # Primary failed, trying fallback
-            logger.warning(f"Primary model failed, trying fallback...")
+            last_error = str(e)
+            logger.warning(f"Model {model} failed: {type(e).__name__}: {last_error[:100]}")
+            time.sleep(0.5)
+            continue
+
+    # All models failed
+    track_error(user_id, last_error)
+    logger.error(f"All models failed for user {user_id}. Last error: {last_error}")
+    if "401" in last_error or "unauthorized" in last_error.lower():
+        return "HF_TOKEN invalid or expired. Please update your HuggingFace API token in Render environment variables."
+    elif "429" in last_error or "rate" in last_error.lower():
+        return "Too many requests right now. Please wait a moment and try again."
+    elif "timeout" in last_error.lower():
+        return "Request timed out. Please try again."
+    else:
+        return "I am having trouble connecting to the AI right now. Please try again in a few seconds."
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FILE PARSERS
