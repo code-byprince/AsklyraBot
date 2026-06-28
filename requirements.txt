@@ -1,10 +1,18 @@
-pyTelegramBotAPI==4.23.0
-Flask==3.1.1
-openai==1.82.1
-gunicorn==23.0.0
+# ── CORE (bot ye libraries ke bina chalega hi nahi) ─────────────────────────
+Flask==3.0.3
+pyTelegramBotAPI==4.21.0
+openai==1.51.0
 requests==2.32.3
+
+# ── OPTIONAL — file analysis (missing hone par bhi bot crash nahi hoga,
+#    sirf wo specific file-type "not installed" bol dega) ───────────────────
 PyPDF2==3.0.1
 python-docx==1.1.2
 openpyxl==3.1.5
-SpeechRecognition==3.12.0
+
+# ── OPTIONAL — voice message transcription ──────────────────────────────────
+# Note: pydub ko system me 'ffmpeg' chahiye (apt-get install ffmpeg / Render
+# build me buildpack add karna padega), warna voice feature silently disable
+# rahega aur bot text-only chalega — crash nahi hoga.
+SpeechRecognition==3.10.4
 pydub==0.25.1
