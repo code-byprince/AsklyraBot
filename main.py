@@ -28,7 +28,11 @@ import aiosqlite
 import docx
 from PIL import Image
 import pytesseract
-import speech_recognition as sr
+try:
+    import whisper as _whisper
+    _WHISPER_AVAILABLE = True
+except ImportError:
+    _WHISPER_AVAILABLE = False
 from pydub import AudioSegment
 from telegram import (
     BotCommand,
@@ -646,7 +650,9 @@ async def ocr_image(image_bytes: bytes) -> str:
 
 
 async def transcribe_audio(ogg_bytes: bytes) -> str:
-    """Convert OGG voice to WAV and transcribe using SpeechRecognition."""
+    """Convert OGG voice to WAV and transcribe using OpenAI Whisper (local)."""
+    if not _WHISPER_AVAILABLE:
+        return "[Voice transcription unavailable: openai-whisper not installed]"
     try:
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f_ogg:
             f_ogg.write(ogg_bytes)
@@ -655,21 +661,28 @@ async def transcribe_audio(ogg_bytes: bytes) -> str:
         try:
             audio = AudioSegment.from_ogg(ogg_path)
             audio.export(wav_path, format="wav")
-            recognizer = sr.Recognizer()
-            with sr.AudioFile(wav_path) as source:
-                audio_data = recognizer.record(source)
-            text = recognizer.recognize_google(audio_data)
-            return text
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, _run_whisper, wav_path
+            )
+            return result
         finally:
             Path(ogg_path).unlink(missing_ok=True)
             Path(wav_path).unlink(missing_ok=True)
-    except sr.UnknownValueError:
-        return "[Could not understand the audio]"
-    except sr.RequestError as exc:
-        return f"[Speech recognition error: {exc}]"
     except Exception as exc:
         logger.warning("Audio transcription failed: %s", exc)
         return f"[Audio processing failed: {exc}]"
+
+
+def _run_whisper(wav_path: str) -> str:
+    """Run Whisper in a thread executor (blocking call)."""
+    try:
+        model = _whisper.load_model("tiny")
+        result = model.transcribe(wav_path)
+        text = result.get("text", "").strip()
+        return text if text else "[Could not understand the audio]"
+    except Exception as exc:
+        return f"[Whisper error: {exc}]"
 
 
 # ─── Core AI handler ──────────────────────────────────────────────────────────
