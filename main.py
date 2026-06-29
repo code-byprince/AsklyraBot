@@ -1,243 +1,264 @@
 import os
-import time
 import logging
 import telebot
 from telebot import types
-from openai import OpenAI
 from flask import Flask, request
+from openai import OpenAI
+from datetime import datetime
 
-# ── Logging Setup ──────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger(__name__)
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+BOT_TOKEN  = os.environ.get("BOT_TOKEN")
+NARA_TOKEN = os.environ.get("NARA_TOKEN")
 
-# ── Environment Variables ───────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-HF_TOKEN  = os.environ.get("HF_TOKEN")
-
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is not set!")
-if not HF_TOKEN:
-    raise ValueError("HF_TOKEN environment variable is not set!")
-
-# ── Client Setup ────────────────────────────────────────────────
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-
-ai_client = OpenAI(
-    base_url="https://router.huggingface.co/v1",
-    api_key=HF_TOKEN,
-)
-
-# ── Flask App for Render.com ────────────────────────────────────
+bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ── In-memory Conversation History (per user) ──────────────────
-conversation_history = {}
-MAX_HISTORY = 10  # last N exchanges kept
+client = OpenAI(
+    base_url="https://router.bynara.id/v1",
+    api_key=NARA_TOKEN,
+)
 
-SYSTEM_PROMPT = """You are a smart, helpful, and friendly AI assistant on Telegram.
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-Rules you must ALWAYS follow:
-- Never use markdown headers like # or ## or ###
-- Never use hashtags
-- Use plain text formatting only
-- Use bold text by wrapping key phrases with <b>...</b> (HTML)
-- Use italic with <i>...</i> for emphasis
-- Use line breaks for structure, not headers
-- Keep responses concise but informative
-- Be warm, natural, and conversational
-- When listing items, use simple dashes (-) or numbers
-- Highlight the most important point in every response using <b>bold</b>
-- React to the user's emotional tone — if they seem happy, be warm; if stuck, be encouraging"""
+# ─── PER-USER CONVERSATION MEMORY ─────────────────────────────────────────────
+user_sessions: dict[int, list[dict]] = {}
 
-# ── Reaction Emojis based on message content ───────────────────
-def pick_reaction(text: str) -> str:
-    text_lower = text.lower()
-    if any(w in text_lower for w in ["thank", "shukriya", "thanks", "dhanyawad"]):
-        return "🙏"
-    if any(w in text_lower for w in ["hello", "hi", "hey", "namaste", "hii"]):
-        return "👋"
-    if any(w in text_lower for w in ["help", "problem", "issue", "error", "stuck"]):
-        return "🛠️"
-    if any(w in text_lower for w in ["joke", "funny", "haha", "lol", "mazak"]):
-        return "😂"
-    if any(w in text_lower for w in ["sad", "cry", "upset", "dukhi", "bura"]):
-        return "❤️"
-    if any(w in text_lower for w in ["wow", "amazing", "awesome", "great", "zabardast"]):
-        return "🔥"
-    if any(w in text_lower for w in ["code", "program", "python", "javascript", "script"]):
-        return "💻"
-    if any(w in text_lower for w in ["idea", "suggest", "plan", "soch"]):
-        return "💡"
-    return "✨"
+SYSTEM_PROMPT = """You are an intelligent, friendly, and helpful AI assistant integrated into Telegram.
 
-# ── Send Reaction (Telegram emoji reaction) ────────────────────
-def send_reaction(chat_id: int, message_id: int, emoji: str):
-    try:
-        bot.set_message_reaction(
-            chat_id=chat_id,
-            message_id=message_id,
-            reaction=[types.ReactionTypeEmoji(emoji=emoji)],
-            is_big=False
-        )
-    except Exception as e:
-        logger.warning(f"Reaction failed (may not be supported in this chat type): {e}")
+Rules you MUST follow strictly:
+1. NEVER use the # symbol anywhere in your responses. Avoid hashtags completely.
+2. NEVER use markdown headers (lines starting with #, ##, ###). Do not use them even if listing topics.
+3. Use *bold* (single asterisks) for Telegram-style bold to highlight key points naturally within sentences.
+4. Use emojis occasionally to make responses feel warm and engaging, but don't overdo it.
+5. Keep responses concise and clear — break long answers into short readable paragraphs.
+6. Use plain dashes ( - ) or numbers for lists, never bullet symbols or headers.
+7. Be conversational, supportive, and adapt your tone to the user's style.
+8. If asked about your identity, say you are an AI assistant powered by DeepSeek.
+9. Remember context within the conversation to give coherent, connected replies.
+10. For code, wrap it in triple backticks with the language name for Telegram's code formatting.
+"""
 
-# ── Call DeepSeek AI ───────────────────────────────────────────
+MAX_HISTORY = 20  # messages to keep per user
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+def get_history(user_id: int) -> list[dict]:
+    return user_sessions.setdefault(user_id, [])
+
+
+def trim_history(user_id: int):
+    history = user_sessions.get(user_id, [])
+    if len(history) > MAX_HISTORY:
+        user_sessions[user_id] = history[-MAX_HISTORY:]
+
+
+def add_to_history(user_id: int, role: str, content: str):
+    get_history(user_id).append({"role": role, "content": content})
+    trim_history(user_id)
+
+
 def ask_deepseek(user_id: int, user_message: str) -> str:
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-
-    conversation_history[user_id].append({
-        "role": "user",
-        "content": user_message
-    })
-
-    # Keep history trimmed
-    if len(conversation_history[user_id]) > MAX_HISTORY * 2:
-        conversation_history[user_id] = conversation_history[user_id][-(MAX_HISTORY * 2):]
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history[user_id]
-
+    add_to_history(user_id, "user", user_message)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_history(user_id)
     try:
-        response = ai_client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-V3-0324:novita",
+        response = client.chat.completions.create(
+            model="deepseek-3.2",
             messages=messages,
-            max_tokens=1024,
+            max_tokens=1500,
             temperature=0.7,
         )
         reply = response.choices[0].message.content.strip()
-
-        # Remove any accidental # headings AI might generate
-        lines = reply.split("\n")
-        cleaned = []
-        for line in lines:
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
-                # Convert heading to bold text instead
-                text = stripped.lstrip("#").strip()
-                cleaned.append(f"<b>{text}</b>")
-            else:
-                cleaned.append(line)
-        reply = "\n".join(cleaned)
-
-        conversation_history[user_id].append({
-            "role": "assistant",
-            "content": reply
-        })
-
+        # Safety: strip any accidental # symbols
+        reply = reply.replace("# ", "").replace("## ", "").replace("### ", "")
+        add_to_history(user_id, "assistant", reply)
         return reply
-
     except Exception as e:
         logger.error(f"DeepSeek API error: {e}")
-        return "⚠️ <b>Oops!</b> AI se connect nahi ho paya. Thodi der baad try karo."
+        return "⚠️ Sorry, I ran into an issue reaching the AI. Please try again in a moment."
 
-# ── /start Command ─────────────────────────────────────────────
+
+def send_typing(chat_id: int):
+    bot.send_chat_action(chat_id, "typing")
+
+
+# ─── MAIN MENU KEYBOARD ───────────────────────────────────────────────────────
+
+def main_menu():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🤖 Chat with AI"),
+        types.KeyboardButton("🔄 Clear History"),
+        types.KeyboardButton("ℹ️ About"),
+        types.KeyboardButton("📊 My Stats"),
+    )
+    return markup
+
+
+# ─── COMMAND HANDLERS ─────────────────────────────────────────────────────────
+
 @bot.message_handler(commands=["start"])
-def handle_start(message):
-    user_name = message.from_user.first_name or "dost"
-    send_reaction(message.chat.id, message.message_id, "👋")
-
+def start(message):
+    name = message.from_user.first_name or "there"
     welcome = (
-        f"👋 <b>Namaste, {user_name}!</b>\n\n"
-        "Main hoon tera <b>AI Assistant</b> — powered by <b>DeepSeek</b> 🤖\n\n"
-        "Tum mujhse kuch bhi pooch sakte ho:\n"
-        "- 💡 Ideas aur suggestions\n"
-        "- 💻 Coding help\n"
-        "- 📚 Koi bhi topic explain karna\n"
-        "- 🗣️ Normal baatein bhi!\n\n"
-        "<b>Bas likho — main hoon yahan!</b>"
+        f"👋 Hello *{name}*! Welcome to your AI-powered assistant.\n\n"
+        "I'm connected to *DeepSeek AI* and ready to help you with anything — "
+        "questions, coding, writing, analysis, or just a friendly chat.\n\n"
+        "Use the menu below or simply *type your message* to get started! 🚀"
     )
-    bot.reply_to(message, welcome)
+    bot.send_message(message.chat.id, welcome, parse_mode="Markdown", reply_markup=main_menu())
 
-# ── /help Command ──────────────────────────────────────────────
+
 @bot.message_handler(commands=["help"])
-def handle_help(message):
-    send_reaction(message.chat.id, message.message_id, "🛠️")
-
+def help_cmd(message):
     help_text = (
-        "🛠️ <b>Commands List</b>\n\n"
-        "/start — Bot shuru karo\n"
-        "/help — Yeh menu dekho\n"
-        "/clear — Apni conversation history delete karo\n"
-        "/about — Bot ke baare mein jano\n\n"
-        "<b>Tip:</b> Seedha apna sawaal likho — main samajh lunga! 😊"
+        "*Available Commands*\n\n"
+        "/start — Welcome message & menu\n"
+        "/help — Show this help\n"
+        "/clear — Clear your conversation history\n"
+        "/stats — See your session stats\n"
+        "/about — About this bot\n\n"
+        "You can also use the keyboard buttons below. Just type anything and I'll reply! 💬"
     )
-    bot.reply_to(message, help_text)
+    bot.send_message(message.chat.id, help_text, parse_mode="Markdown", reply_markup=main_menu())
 
-# ── /clear Command ─────────────────────────────────────────────
+
 @bot.message_handler(commands=["clear"])
-def handle_clear(message):
+def clear_history(message):
     user_id = message.from_user.id
-    conversation_history.pop(user_id, None)
-    send_reaction(message.chat.id, message.message_id, "✨")
-    bot.reply_to(message, "🗑️ <b>Conversation history clear ho gayi!</b>\nFresh start karo. 😊")
-
-# ── /about Command ─────────────────────────────────────────────
-@bot.message_handler(commands=["about"])
-def handle_about(message):
-    send_reaction(message.chat.id, message.message_id, "💡")
-    about_text = (
-        "🤖 <b>About This Bot</b>\n\n"
-        "Model: <b>DeepSeek-V3</b> via HuggingFace Router\n"
-        "Memory: Last 10 messages yaad rehte hain\n"
-        "Language: Hindi + English dono samajhta hoon\n\n"
-        "<b>Built with:</b> Python, pyTelegramBotAPI, OpenAI SDK"
+    user_sessions[user_id] = []
+    bot.send_message(
+        message.chat.id,
+        "🗑️ Conversation history cleared! We're starting fresh. What would you like to talk about?",
+        reply_markup=main_menu()
     )
-    bot.reply_to(message, about_text)
 
-# ── Main Message Handler ────────────────────────────────────────
-@bot.message_handler(func=lambda msg: True, content_types=["text"])
+
+@bot.message_handler(commands=["stats"])
+def stats_cmd(message):
+    user_id = message.from_user.id
+    history = get_history(user_id)
+    user_msgs  = sum(1 for m in history if m["role"] == "user")
+    bot_msgs   = sum(1 for m in history if m["role"] == "assistant")
+    stats_text = (
+        f"📊 *Your Session Stats*\n\n"
+        f"Messages you sent: *{user_msgs}*\n"
+        f"My replies: *{bot_msgs}*\n"
+        f"Total exchanges: *{len(history)}*\n\n"
+        f"Use /clear to reset the conversation anytime."
+    )
+    bot.send_message(message.chat.id, stats_text, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["about"])
+def about_cmd(message):
+    about_text = (
+        "*About This Bot*\n\n"
+        "This is an advanced AI chatbot powered by *DeepSeek 3.2* via the Nara AI router.\n\n"
+        "- Remembers your conversation context\n"
+        "- Replies with clean, readable formatting\n"
+        "- Handles coding, writing, Q&A, and more\n"
+        "- Runs 24/7 on Render.com\n\n"
+        "Built with ❤️ using pyTelegramBotAPI and OpenAI-compatible API."
+    )
+    bot.send_message(message.chat.id, about_text, parse_mode="Markdown")
+
+
+# ─── KEYBOARD BUTTON HANDLERS ─────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "🔄 Clear History")
+def btn_clear(message):
+    clear_history(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "ℹ️ About")
+def btn_about(message):
+    about_cmd(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "📊 My Stats")
+def btn_stats(message):
+    stats_cmd(message)
+
+
+@bot.message_handler(func=lambda m: m.text == "🤖 Chat with AI")
+def btn_chat(message):
+    bot.send_message(
+        message.chat.id,
+        "💬 Great! Just type your message and I'll respond. Ask me anything!",
+        reply_markup=main_menu()
+    )
+
+
+# ─── REACTION + AI REPLY ──────────────────────────────────────────────────────
+
+REACTIONS = ["👍", "🔥", "❤️", "🤩", "👏", "💡", "✅", "🎯"]
+
+import random
+
+def send_reaction(chat_id: int, message_id: int):
+    """Send a random emoji reaction to the user's message."""
+    try:
+        emoji = random.choice(REACTIONS)
+        bot.set_message_reaction(
+            chat_id,
+            message_id,
+            reaction=[types.ReactionTypeEmoji(emoji)],
+            is_big=False
+        )
+    except Exception:
+        pass  # Reactions may not be supported in all chat types — fail silently
+
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_message(message):
     user_id   = message.from_user.id
+    chat_id   = message.chat.id
+    msg_id    = message.message_id
     user_text = message.text.strip()
 
-    if not user_text:
-        return
-
-    # Send reaction first based on user's message
-    emoji = pick_reaction(user_text)
-    send_reaction(message.chat.id, message.message_id, emoji)
+    # React to the user's message
+    send_reaction(chat_id, msg_id)
 
     # Show typing indicator
-    bot.send_chat_action(message.chat.id, "typing")
+    send_typing(chat_id)
 
     # Get AI response
     reply = ask_deepseek(user_id, user_text)
 
-    bot.reply_to(message, reply)
+    bot.send_message(chat_id, reply, parse_mode="Markdown", reply_markup=main_menu())
 
-# ── Webhook Route for Render.com ───────────────────────────────
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # optional: set on Render
+
+# ─── FLASK WEBHOOK ────────────────────────────────────────────────────────────
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    if request.headers.get("content-type") == "application/json":
-        json_data = request.get_data(as_text=True)
-        update = telebot.types.Update.de_json(json_data)
-        bot.process_new_updates([update])
-        return "OK", 200
-    return "Bad Request", 400
+    json_data = request.get_json(force=True)
+    update = telebot.types.Update.de_json(json_data)
+    bot.process_new_updates([update])
+    return "OK", 200
+
 
 @app.route("/", methods=["GET"])
 def index():
-    return "✅ Bot is running!", 200
+    return "Bot is running! 🚀", 200
 
-# ── Entry Point ─────────────────────────────────────────────────
+
+# ─── STARTUP ──────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-
-    if WEBHOOK_URL:
-        # Webhook mode (for Render.com)
+    RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if RENDER_URL:
+        webhook_url = f"{RENDER_URL}/{BOT_TOKEN}"
         bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
-        logger.info(f"Webhook set: {WEBHOOK_URL}/{BOT_TOKEN}")
-        app.run(host="0.0.0.0", port=port, debug=False)
+        bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook set: {webhook_url}")
     else:
-        # Polling mode (for local testing)
-        logger.info("Starting in polling mode...")
+        # Local polling fallback
         bot.remove_webhook()
-        bot.infinity_polling(timeout=30, long_polling_timeout=20)
+        logger.info("Running in polling mode (local dev)...")
+        bot.infinity_polling()
+        import sys; sys.exit()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
