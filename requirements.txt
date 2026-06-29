@@ -1,4 +1,25 @@
-pyTelegramBotAPI
-Flask
-openai
-gunicorn
+# ──────────────────────────────────────────────────────────────────────────────
+#  requirements.txt — Telegram AI Chatbot
+#  Python 3.12+ | Render-compatible | pin to avoid breaking changes
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Telegram Bot framework (v22+)
+python-telegram-bot[job-queue]==22.1
+
+# Async HTTP client (OpenRouter API calls + file downloads)
+aiohttp==3.11.18
+
+# Async SQLite
+aiosqlite==0.20.0
+
+# PDF parsing
+pypdf==5.4.0
+
+# DOCX parsing
+python-docx==1.1.2
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Transitive dependencies pinned for reproducibility on Render
+# ──────────────────────────────────────────────────────────────────────────────
+httpx==0.28.1
+anyio==4.9.0
