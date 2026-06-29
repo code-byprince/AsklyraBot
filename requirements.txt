@@ -6,4 +6,4 @@ pdfminer.six==20231228
 Pillow==10.4.0
 pytesseract==0.3.13
 pydub==0.25.1
-openai-whisper==20231117
+groq==0.9.0
