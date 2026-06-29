@@ -29,10 +29,10 @@ import docx
 from PIL import Image
 import pytesseract
 try:
-    import whisper as _whisper
-    _WHISPER_AVAILABLE = True
+    from groq import Groq as _Groq
+    _GROQ_AVAILABLE = True
 except ImportError:
-    _WHISPER_AVAILABLE = False
+    _GROQ_AVAILABLE = False
 from pydub import AudioSegment
 from telegram import (
     BotCommand,
@@ -56,6 +56,7 @@ from telegram.error import TelegramError
 # ─── Environment ────────────────────────────────────────────────────────────
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 OPENROUTER_API_KEY: str = os.environ["OPENROUTER_API_KEY"]
+GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
 ADMIN_IDS_RAW: str = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS: list[int] = [
     int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()
@@ -650,39 +651,41 @@ async def ocr_image(image_bytes: bytes) -> str:
 
 
 async def transcribe_audio(ogg_bytes: bytes) -> str:
-    """Convert OGG voice to WAV and transcribe using OpenAI Whisper (local)."""
-    if not _WHISPER_AVAILABLE:
-        return "[Voice transcription unavailable: openai-whisper not installed]"
+    """Convert OGG voice to MP3 and transcribe using Groq Whisper API."""
+    if not _GROQ_AVAILABLE or not GROQ_API_KEY:
+        return "[Voice transcription unavailable: set GROQ_API_KEY env variable]"
     try:
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f_ogg:
             f_ogg.write(ogg_bytes)
             ogg_path = f_ogg.name
-        wav_path = ogg_path.replace(".ogg", ".wav")
+        mp3_path = ogg_path.replace(".ogg", ".mp3")
         try:
             audio = AudioSegment.from_ogg(ogg_path)
-            audio.export(wav_path, format="wav")
+            audio.export(mp3_path, format="mp3")
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, _run_whisper, wav_path
-            )
+            result = await loop.run_in_executor(None, _run_groq_transcribe, mp3_path)
             return result
         finally:
             Path(ogg_path).unlink(missing_ok=True)
-            Path(wav_path).unlink(missing_ok=True)
+            Path(mp3_path).unlink(missing_ok=True)
     except Exception as exc:
         logger.warning("Audio transcription failed: %s", exc)
         return f"[Audio processing failed: {exc}]"
 
 
-def _run_whisper(wav_path: str) -> str:
-    """Run Whisper in a thread executor (blocking call)."""
+def _run_groq_transcribe(mp3_path: str) -> str:
+    """Call Groq Whisper API synchronously (runs in executor)."""
     try:
-        model = _whisper.load_model("tiny")
-        result = model.transcribe(wav_path)
-        text = result.get("text", "").strip()
-        return text if text else "[Could not understand the audio]"
+        client = _Groq(api_key=GROQ_API_KEY)
+        with open(mp3_path, "rb") as f:
+            transcription = client.audio.transcriptions.create(
+                file=(Path(mp3_path).name, f.read()),
+                model="whisper-large-v3-turbo",
+                response_format="text",
+            )
+        return str(transcription).strip() if transcription else "[Could not understand the audio]"
     except Exception as exc:
-        return f"[Whisper error: {exc}]"
+        return f"[Groq transcription error: {exc}]"
 
 
 # ─── Core AI handler ──────────────────────────────────────────────────────────
